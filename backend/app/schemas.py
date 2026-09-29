@@ -2,12 +2,43 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Generic, TypeVar
 from uuid import UUID
+from typing import Literal
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from app.models.entities import InvoiceStatus, InvoiceType, MemberRole
 
 class ORMModel(BaseModel): model_config=ConfigDict(from_attributes=True)
 class RegisterIn(BaseModel): email: EmailStr; password: str=Field(min_length=12); full_name: str=Field(min_length=1,max_length=200); organization_name: str=Field(min_length=1,max_length=200)
 class LoginIn(BaseModel): email: EmailStr; password: str
+class SetupIn(BaseModel):
+    database_mode: Literal["bundled", "external"] = "bundled"
+    database_host: str = "localhost"
+    database_port: int = Field(default=5432, ge=1, le=65535)
+    database_name: str = "openinvoice"
+    database_username: str = "openinvoice"
+    database_password: str = ""
+    database_ssl: bool = False
+    email_provider: Literal["console", "smtp"] = "console"
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_use_tls: bool = True
+    storage_provider: Literal["local", "s3"] = "local"
+    s3_endpoint_url: str = ""
+    s3_bucket: str = ""
+    s3_access_key_id: str = ""
+    s3_secret_access_key: str = ""
+    s3_region: str = "eu-central-1"
+    banking_provider: Literal["mock", "enable_banking"] = "mock"
+    enable_banking_app_id: str = ""
+    enable_banking_private_key_path: str = ""
+    session_cookie_secure: bool = False
+
+    @field_validator("database_host", "database_name", "database_username", "smtp_host", "smtp_from", "s3_bucket", "s3_region", mode="before")
+    @classmethod
+    def strip_configuration_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
 class UserOut(ORMModel): id: UUID; email: EmailStr; full_name: str
 class OrganizationOut(ORMModel): id: UUID; name: str; country: str; currency: str
 class CustomerIn(BaseModel):

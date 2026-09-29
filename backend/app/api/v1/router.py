@@ -2,26 +2,93 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from io import BytesIO
 from uuid import UUID
+import asyncio
+import smtplib
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
+from sqlalchemy.engine import URL
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import current_membership, current_user, hash_password, verify_password, write_membership
 from app.core.config import settings
+from app.core.runtime_config import config_path, read_saved_settings, save_settings, settings_are_applied
 from app.db.session import get_db
 from app.models.entities import AuditLog, BankAccount, Customer, EmailDelivery, Invoice, InvoiceDocument, InvoiceLine, InvoiceStatus, InvoiceType, Organization, OrganizationMember, Supplier, User
 from app.providers.banking import EnableBankingProvider, MockBankingProvider
 from app.providers.email import email_provider
 from app.providers.storage import storage_provider
-from app.schemas import CustomerIn, CustomerOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, RegisterIn, SupplierIn, SupplierOut, UserOut
+from app.schemas import CustomerIn, CustomerOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, RegisterIn, SetupIn, SupplierIn, SupplierOut, UserOut
 from app.services import create_invoice, money
 
 router=APIRouter()
+setup_lock=asyncio.Lock()
+
+@router.get("/setup/status")
+async def setup_status():
+    saved=read_saved_settings()
+    configured=bool(saved and saved.get("setup_completed"))
+    applied=settings_are_applied(settings,saved)
+    return {"complete":configured,"applied":applied,"database_mode":saved.get("database_mode") if saved else None}
+
+async def verify_database(url: str) -> None:
+    engine=create_async_engine(url,connect_args={"timeout":8})
+    try:
+        async with engine.connect() as connection: await connection.execute(text("SELECT 1"))
+    finally:
+        await engine.dispose()
+
+def verify_smtp(values: SetupIn) -> None:
+    if not values.smtp_host or not values.smtp_from:
+        raise ValueError("SMTP host and from address are required")
+    with smtplib.SMTP(values.smtp_host,values.smtp_port,timeout=8) as server:
+        if values.smtp_use_tls: server.starttls()
+        if values.smtp_username: server.login(values.smtp_username,values.smtp_password)
+
+def verify_s3(values: SetupIn) -> None:
+    if not all((values.s3_bucket,values.s3_access_key_id,values.s3_secret_access_key)):
+        raise ValueError("S3 bucket, access key, and secret key are required")
+    import boto3
+    client=boto3.client("s3",endpoint_url=values.s3_endpoint_url or None,aws_access_key_id=values.s3_access_key_id,aws_secret_access_key=values.s3_secret_access_key,region_name=values.s3_region)
+    client.head_bucket(Bucket=values.s3_bucket)
+
+@router.post("/setup/configure",status_code=200)
+async def configure_installation(payload:SetupIn):
+    async with setup_lock:
+        if config_path().exists(): raise HTTPException(409,"OpenInvoice is already configured")
+        if payload.database_mode=="external":
+            database_url=URL.create("postgresql+asyncpg",username=payload.database_username,password=payload.database_password,host=payload.database_host,port=payload.database_port,database=payload.database_name)
+            if payload.database_ssl: database_url=database_url.update_query_dict({"ssl":"require"})
+            url=database_url.render_as_string(hide_password=False)
+        else:
+            url=settings.database_url
+        try: await verify_database(url)
+        except Exception as exc: raise HTTPException(422,"Could not connect to PostgreSQL. Check the host, database, credentials, and network access.") from exc
+        if payload.email_provider=="smtp":
+            try: await asyncio.to_thread(verify_smtp,payload)
+            except Exception as exc: raise HTTPException(422,"Could not connect to SMTP. Check the server, TLS setting, and credentials.") from exc
+        if payload.storage_provider=="s3":
+            try: await asyncio.to_thread(verify_s3,payload)
+            except Exception as exc: raise HTTPException(422,"Could not access the S3 bucket. Check its endpoint, region, name, and credentials.") from exc
+        values=payload.model_dump(exclude={"database_host","database_port","database_name","database_username","database_password","database_ssl"})
+        values.update({"database_url":url,"setup_completed":True,"local_storage_path":settings.local_storage_path})
+        if payload.storage_provider=="local":
+            from pathlib import Path
+            import tempfile
+            try:
+                Path(settings.local_storage_path).mkdir(parents=True,exist_ok=True)
+                with tempfile.NamedTemporaryFile(dir=settings.local_storage_path): pass
+            except OSError as exc: raise HTTPException(422,"The local storage directory is not writable") from exc
+        save_settings(values)
+        return {"status":"saved","restart_required":True,"message":"Configuration saved securely. Restart the API so it can run migrations with these settings."}
 
 @router.post("/auth/register",response_model=UserOut,status_code=201)
 async def register(payload:RegisterIn,request:Request,db:AsyncSession=Depends(get_db)):
+    saved=read_saved_settings()
+    if not saved or not saved.get("setup_completed"): raise HTTPException(409,"Complete installation setup before creating an account")
+    if not settings_are_applied(settings,saved): raise HTTPException(409,"Restart the API to apply configuration before creating an account")
     if await db.scalar(select(User).where(User.email==payload.email.lower())): raise HTTPException(409,"Email already registered")
     user=User(email=payload.email.lower(),password_hash=hash_password(payload.password),full_name=payload.full_name)
     org=Organization(name=payload.organization_name)

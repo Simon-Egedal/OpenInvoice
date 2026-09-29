@@ -19,17 +19,19 @@ The backend is a FastAPI modular monolith. Versioned routes are in `backend/app/
 
 ## Requirements and quick start
 
-Install Docker and Docker Compose. Copy `.env.example` to `.env`, change `POSTGRES_PASSWORD` and `SECRET_KEY`, then run:
+Install Docker and Docker Compose, then start the bundled services:
 
 ```bash
 docker compose up --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000) and create the first account. The API and OpenAPI docs are at [http://localhost:8000](http://localhost:8000) and [http://localhost:8000/docs](http://localhost:8000/docs). The default banking provider is mock; email is console-only until SMTP is configured.
+Open [http://localhost:3000](http://localhost:3000) and follow the first-run setup to verify PostgreSQL, configure SMTP and document storage, and choose a banking provider. Provider settings are encrypted on the persistent application volume; an application signing key is generated on first start. If you select an external PostgreSQL server, restart the API when prompted so its migrations run against that database. Then create the first owner account. The API and OpenAPI docs are at [http://localhost:8000](http://localhost:8000) and [http://localhost:8000/docs](http://localhost:8000/docs). The default banking provider is mock; console email is useful for local development.
+
+`.env` is optional for local startup. Use `.env.example` to customize the bundled PostgreSQL credentials, ports, or other deployment defaults before starting the containers. Keep your Docker data volumes: they contain the encrypted settings and their key, as well as local invoice files.
 
 ## Configuration
 
-See `.env.example` for all supported variables. PostgreSQL is the only required service. `STORAGE_PROVIDER=local` stores documents in the persistent `invoice_files` volume. Use `S3_ENDPOINT_URL`, bucket, region, and credentials to configure an S3-compatible backend. Set `EMAIL_PROVIDER=smtp` and the `SMTP_*` variables to send mail. `BANKING_PROVIDER=enable_banking` selects the isolated adapter scaffold; live operations intentionally return a clear not-implemented response pending an implementation against the current official API specification.
+See `.env.example` for optional deployment overrides. PostgreSQL is the only required service. The setup wizard verifies SMTP and S3 access before saving credentials. `STORAGE_PROVIDER=local` stores documents in the persistent `invoice_files` volume. The Enable Banking adapter remains a scaffold; live operations are not implemented yet.
 
 `SECRET_KEY` must be a long random secret in deployments. Set `SESSION_COOKIE_SECURE=true` behind HTTPS. The default CORS origin is `FRONTEND_URL`.
 

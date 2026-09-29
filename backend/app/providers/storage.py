@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from uuid import uuid4
 import boto3
+import os
 from app.core.config import settings
 
 class StorageProvider(ABC):
@@ -19,7 +20,7 @@ class LocalStorageProvider(StorageProvider):
 class S3StorageProvider(StorageProvider):
     """Generic S3-compatible implementation; configure endpoint for MinIO/R2/etc."""
     def __init__(self):
-        self.client=boto3.client("s3",endpoint_url=__import__("os").getenv("S3_ENDPOINT_URL") or None,aws_access_key_id=__import__("os").getenv("S3_ACCESS_KEY_ID"),aws_secret_access_key=__import__("os").getenv("S3_SECRET_ACCESS_KEY"),region_name=__import__("os").getenv("S3_REGION","eu-central-1")); self.bucket=__import__("os").environ["S3_BUCKET"]
+        self.client=boto3.client("s3",endpoint_url=settings.s3_endpoint_url or None,aws_access_key_id=settings.s3_access_key_id or os.getenv("S3_ACCESS_KEY_ID"),aws_secret_access_key=settings.s3_secret_access_key or os.getenv("S3_SECRET_ACCESS_KEY"),region_name=settings.s3_region); self.bucket=settings.s3_bucket or os.getenv("S3_BUCKET","")
     async def put(self,content,filename,content_type):
         key=str(uuid4()); self.client.put_object(Bucket=self.bucket,Key=key,Body=content,ContentType=content_type); return key
     async def get(self,key): return self.client.get_object(Bucket=self.bucket,Key=key)["Body"].read()

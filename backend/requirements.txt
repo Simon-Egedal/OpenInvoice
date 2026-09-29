@@ -10,4 +10,5 @@ itsdangerous>=2.2,<3
 python-multipart>=0.0.9
 reportlab>=4.2,<5
 boto3>=1.35,<2
+cryptography>=43,<47
 pytest>=8.3,<9
