@@ -69,11 +69,24 @@ def save_settings(values: dict[str, Any]) -> None:
 def read_saved_settings() -> dict[str, Any] | None:
     return _read_settings()
 
+IGNORED_APPLIED_KEYS = {
+    "setup_completed",
+    "database_mode",
+    "database_host",
+    "database_port",
+    "database_name",
+    "database_username",
+    "database_password",
+    "database_ssl",
+    "secret_key",
+}
+
 def settings_are_applied(settings: Any, values: dict[str, Any] | None) -> bool:
     if not values or not values.get("setup_completed"):
         return False
     return all(
         getattr(settings, name, object()) == value
         for name, value in values.items()
-        if name not in {"setup_completed", "database_mode"}
+        if name not in IGNORED_APPLIED_KEYS and hasattr(settings, name)
     )
+

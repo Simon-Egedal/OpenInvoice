@@ -9,3 +9,5 @@ dist/
 storage/
 *.py[cod]
 temp.txt
+secrets/
+*.pem
