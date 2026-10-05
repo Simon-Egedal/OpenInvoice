@@ -42,6 +42,11 @@ from app.providers.banking import EnableBankingProvider, MockBankingProvider
 from app.providers.email import email_provider
 from app.providers.storage import storage_provider
 from app.schemas import (
+    AccountCreateIn,
+    AccountOut,
+    CurrentUserOut,
+    ProfileUpdateIn,
+    PasswordChangeIn,
     BankAuthorizeIn,
     BankCallbackIn,
     BankTransactionDetailOut,
@@ -73,6 +78,9 @@ from app.schemas import (
     UserOut,
 )
 from app.services import (
+    create_member_account,
+    update_user_profile,
+    change_user_password,
     create_initial_admin,
     create_initial_organization,
     create_invoice,
@@ -302,12 +310,34 @@ async def register(payload:RegisterIn,request:Request,db:AsyncSession=Depends(ge
 @router.post("/auth/login",response_model=UserOut)
 async def login(payload:LoginIn,request:Request,db:AsyncSession=Depends(get_db)):
     user=await db.scalar(select(User).where(User.email==payload.email.lower()))
-    if not user or not verify_password(payload.password,user.password_hash): raise HTTPException(401,"Invalid email or password")
+    if not user or not user.is_active or not verify_password(payload.password,user.password_hash): raise HTTPException(401,"Invalid email or password")
     request.session["user_id"]=str(user.id); return user
 @router.post("/auth/logout",status_code=204)
 async def logout(request:Request): request.session.clear(); return Response(status_code=204)
-@router.get("/auth/me",response_model=UserOut)
-async def me(user:User=Depends(current_user)): return user
+@router.get("/auth/me",response_model=CurrentUserOut)
+async def me(user:User=Depends(current_user), m:OrganizationMember=Depends(current_membership)):
+    return {"id": user.id, "email": user.email, "full_name": user.full_name, "role": m.role}
+
+@router.patch("/auth/profile", response_model=UserOut)
+async def update_profile(payload: ProfileUpdateIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    return await update_user_profile(db, user, payload.full_name)
+
+@router.post("/auth/password", status_code=204)
+async def change_password(payload: PasswordChangeIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    await change_user_password(db, user, payload.current_password, payload.new_password)
+    return Response(status_code=204)
+
+@router.get("/administration/accounts", response_model=list[AccountOut])
+async def list_accounts(m: OrganizationMember = Depends(admin_membership), db: AsyncSession = Depends(get_db)):
+    rows = await db.execute(select(User, OrganizationMember.role).join(OrganizationMember, OrganizationMember.user_id == User.id)
+                            .where(OrganizationMember.organization_id == m.organization_id).order_by(User.email))
+    return [{"id": user.id, "email": user.email, "full_name": user.full_name, "role": role} for user, role in rows.all()]
+
+@router.post("/administration/accounts", response_model=AccountOut, status_code=201)
+async def create_account(payload: AccountCreateIn, m: OrganizationMember = Depends(admin_membership),
+                         user: User = Depends(current_user), db: AsyncSession = Depends(get_db),
+                         provider = Depends(email_provider)):
+    return await create_member_account(db, payload, m, user, provider)
 @router.get("/organizations", response_model=list[OrganizationOut])
 async def organizations(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     rows = await db.execute(

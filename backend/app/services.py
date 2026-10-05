@@ -2,10 +2,15 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 from uuid import UUID
+import secrets
+import logging
+from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func, select
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.auth import hash_password
+from app.auth import hash_password, verify_password
+from app.providers.email import EmailProvider
 from app.core.runtime_config import settings_are_applied
 from app.models.entities import (
     AuditLog,
@@ -25,6 +30,47 @@ from app.models.entities import (
 from app.providers.storage import storage_provider
 
 CENT=Decimal("0.01")
+
+async def create_member_account(db: AsyncSession, payload, membership, actor: User, provider: EmailProvider):
+    email = str(payload.email).lower()
+    if await db.scalar(select(User).where(func.lower(User.email) == email)):
+        raise HTTPException(409, "An account with this email already exists")
+    organization = await db.scalar(select(Organization).where(Organization.id == membership.organization_id))
+    if not organization:
+        raise HTTPException(404, "Organization not found")
+    password = secrets.token_urlsafe(24)
+    user = User(email=email, full_name=email.split("@", 1)[0][:200], password_hash=hash_password(password))
+    try:
+        db.add(user)
+        await db.flush()
+        db.add(OrganizationMember(organization_id=membership.organization_id, user_id=user.id, role=payload.role))
+        db.add(AuditLog(organization_id=membership.organization_id, user_id=actor.id,
+                        action="account.created", entity_type="user", entity_id=user.id,
+                        new_values={"email": email, "role": payload.role}))
+        await db.flush()
+        await provider.send_account_credentials(email, password, payload.role, organization.name)
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(409, "An account with this email already exists") from None
+    except Exception:
+        await db.rollback()
+        logging.getLogger(__name__).warning("Account creation or credentials email delivery failed")
+        raise HTTPException(502, "Unable to create account and send credentials. Check SMTP configuration and try again.") from None
+    return {"id": user.id, "email": user.email, "full_name": user.full_name, "role": payload.role}
+
+async def update_user_profile(db: AsyncSession, user: User, full_name: str):
+    user.full_name = full_name
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+async def change_user_password(db: AsyncSession, user: User, current_password: str, new_password: str):
+    if not verify_password(current_password, user.password_hash):
+        raise HTTPException(400, "Current password is incorrect")
+    user.password_hash = hash_password(new_password)
+    await db.commit()
+
 def money(value: Decimal)->Decimal: return value.quantize(CENT,rounding=ROUND_HALF_UP)
 
 async def create_invoice(db: AsyncSession, data, organization_id, user_id)->Invoice:
@@ -496,6 +542,5 @@ async def unlink_invoice_transaction(
     await db.commit()
     await db.refresh(invoice)
     return invoice
-
 
 

@@ -3,7 +3,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { API, api, CurrentUser, Invoice, Organization, SetupStatus } from "@/lib/api";
-import { Activity, Building2, ChevronDown, FileText, LayoutDashboard, LogIn, LogOut, Menu, Package, Settings, Users, WalletCards, X } from "lucide-react";
+import { Activity, Building2, ChevronDown, FileText, LayoutDashboard, LogIn, LogOut, Menu, Package, Settings, ShieldCheck, Users, WalletCards, X } from "lucide-react";
 
 const links = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
@@ -48,7 +48,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     let active = true;
     setAuthCheckedPath(null);
-    api<CurrentUser>("/auth/me")
+    const fetchUser = () => api<CurrentUser>("/auth/me")
       .then((user) => {
         if (active) setCurrentUser(user);
       })
@@ -58,7 +58,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       .finally(() => {
         if (active) setAuthCheckedPath(path);
       });
-    return () => { active = false; };
+    fetchUser();
+    window.addEventListener("profileUpdated", fetchUser);
+    return () => { active = false; window.removeEventListener("profileUpdated", fetchUser); };
   }, [path]);
 
   useEffect(() => {
@@ -165,6 +167,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           ))}
         </nav>
         <div className="sidebar-bottom">
+          {currentUser && ["owner", "admin"].includes(currentUser.role) && (
+            <Link href="/administration" onClick={() => setOpen(false)} className={`nav-link ${path === "/administration" ? "active" : ""}`}>
+              <ShieldCheck size={17} />Administration
+            </Link>
+          )}
           <Link href="/settings" className={`nav-link ${path === "/settings" ? "active" : ""}`}>
             <Settings size={17} />
             Settings

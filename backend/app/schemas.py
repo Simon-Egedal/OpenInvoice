@@ -69,6 +69,28 @@ class InfrastructureSettingsOut(BaseModel):
     session_cookie_secure: bool = False
     restart_required: bool = False
 class UserOut(ORMModel): id: UUID; email: EmailStr; full_name: str
+class CurrentUserOut(UserOut):
+    role: MemberRole
+
+class AccountCreateIn(BaseModel):
+    email: EmailStr
+    role: Literal["member", "admin"]
+
+class AccountOut(UserOut):
+    role: MemberRole
+
+class ProfileUpdateIn(BaseModel):
+    full_name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("full_name", mode="before")
+    @classmethod
+    def strip_name(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+class PasswordChangeIn(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=12, max_length=256)
+
 class OrganizationOut(ORMModel):
     id: UUID
     name: str

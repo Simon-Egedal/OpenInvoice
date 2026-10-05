@@ -35,6 +35,10 @@ See `.env.example` for optional deployment overrides. PostgreSQL is the only req
 
 `SECRET_KEY` must be a long random secret in deployments. Set `SESSION_COOKIE_SECURE=true` behind HTTPS. The default CORS origin is `FRONTEND_URL`.
 
+Administrators and the initial owner can open **Administration** to manage the organization profile, infrastructure, and member or administrator accounts. The organization profile includes its name, default currency, country, and logo. New accounts are created by email and role; passwords are generated automatically, stored as hashes, and sent to the recipient through SMTP. Configure SMTP and restart the API when prompted before creating accounts; console email cannot deliver account credentials. Set `FRONTEND_URL` to the address recipients should use to sign in. Existing email addresses are rejected without changing their passwords or memberships.
+
+All signed-in users can update their name and change their password in **Settings**. Changing a password requires the current password and a new password of at least 12 characters.
+
 ## Migrations and development
 
 The API container runs `alembic upgrade head` before starting. For local backend development:

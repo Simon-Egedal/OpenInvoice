@@ -99,7 +99,7 @@ export type BankTransactionItem = {
 
 export type Party = { id:string; name:string; email:string|null; phone:string|null; address:string|null; postal_code:string|null; city:string|null; country:string; vat_number:string|null; payment_information:string|null; notes:string|null };
 export type Product = { id: string; name: string; unit_price: string };
-export type CurrentUser = { id: string; email: string; full_name: string };
+export type CurrentUser = { id: string; email: string; full_name: string; role: "owner" | "admin" | "member" | "accountant" | "approver" | "viewer" };
 export type SetupStatus = {
   complete: boolean;
   applied: boolean;
