@@ -16,11 +16,11 @@ from app.auth import admin_membership, current_membership, current_user, hash_pa
 from app.core.config import settings
 from app.core.runtime_config import config_path, read_saved_settings, save_settings, settings_are_applied
 from app.db.session import get_db
-from app.models.entities import AuditLog, BankAccount, Customer, EmailDelivery, Invoice, InvoiceDocument, InvoiceLine, InvoiceStatus, InvoiceType, Organization, OrganizationMember, Supplier, User
+from app.models.entities import AuditLog, BankAccount, BankConnection, BankTransaction, Customer, EmailDelivery, Invoice, InvoiceDocument, InvoiceLine, InvoiceStatus, InvoiceType, Organization, OrganizationMember, Supplier, User
 from app.providers.banking import EnableBankingProvider, MockBankingProvider
 from app.providers.email import email_provider
 from app.providers.storage import storage_provider
-from app.schemas import CustomerIn, CustomerOut, InfrastructureSettingsIn, InfrastructureSettingsOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, RegisterIn, SetupAdminIn, SetupIn, SetupOrgOut, SupplierIn, SupplierOut, UserOut
+from app.schemas import BankAuthorizeIn, BankCallbackIn, CustomerIn, CustomerOut, InfrastructureSettingsIn, InfrastructureSettingsOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, RegisterIn, SetupAdminIn, SetupIn, SetupOrgOut, SupplierIn, SupplierOut, UserOut
 from app.services import create_initial_admin, create_initial_organization, create_invoice, get_infrastructure_config, money, prepare_infrastructure_update
 
 router=APIRouter()
@@ -377,21 +377,246 @@ async def send_invoice(invoice_id:UUID,user=Depends(current_user),m=Depends(curr
     await db.commit(); return {"status":delivery.status,"recipient":delivery.recipient}
 
 @router.get("/banking/accounts")
-async def bank_accounts(m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
-    result=await db.execute(select(BankAccount).where(BankAccount.organization_id==m.organization_id)); saved=result.scalars().all()
-    if saved: return saved
-    if settings.banking_provider=="enable_banking": return []
-    provider=MockBankingProvider(); account=(await provider.get_accounts("demo"))[0]; balance=(await provider.get_balances(account["id"]))[0]
-    return [{**account,"balance":balance["amount"],"last_synced_at":datetime.now(timezone.utc)}]
+@router.get("/banking/aspsps")
+async def get_banking_aspsps(
+    country: str | None = None,
+    m: OrganizationMember = Depends(current_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    provider = EnableBankingProvider() if settings.banking_provider == "enable_banking" else MockBankingProvider()
+    if not country:
+        org = await db.scalar(select(Organization).where(Organization.id == m.organization_id))
+        country = org.country if org and org.country else "DK"
+    try:
+        banks = await provider.get_aspsps(country)
+        return {"country": country, "banks": banks}
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to retrieve banks from provider: {exc}") from exc
+
+@router.get("/banking/accounts")
+async def bank_accounts(m: OrganizationMember = Depends(current_membership), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(BankAccount)
+        .where(BankAccount.organization_id == m.organization_id)
+        .order_by(BankAccount.created_at.asc())
+    )
+    saved = result.scalars().all()
+    if saved:
+        return [
+            {
+                "id": str(a.id),
+                "name": a.name,
+                "bank": a.bank_name,
+                "masked_number": a.masked_number,
+                "currency": a.currency,
+                "balance": str(a.balance),
+                "last_synced_at": a.last_synced_at.isoformat() if a.last_synced_at else None,
+            }
+            for a in saved
+        ]
+    if settings.banking_provider == "enable_banking":
+        return []
+    provider = MockBankingProvider()
+    account = (await provider.get_accounts("demo"))[0]
+    balance = (await provider.get_balances(account["id"]))[0]
+    return [{**account, "balance": str(balance["amount"]), "last_synced_at": datetime.now(timezone.utc).isoformat()}]
+
 @router.get("/banking/transactions")
-async def bank_transactions(m=Depends(current_membership)):
-    if settings.banking_provider=="enable_banking": return []
+async def bank_transactions(m: OrganizationMember = Depends(current_membership), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(BankTransaction)
+        .where(BankTransaction.organization_id == m.organization_id)
+        .order_by(BankTransaction.booked_at.desc())
+        .limit(100)
+    )
+    saved = result.scalars().all()
+    if saved:
+        return [
+            {
+                "id": str(t.id),
+                "booked_at": t.booked_at.isoformat(),
+                "description": t.description,
+                "counterparty": t.counterparty or "",
+                "amount": str(t.amount),
+                "currency": t.currency,
+                "reference": t.reference,
+            }
+            for t in saved
+        ]
+    if settings.banking_provider == "enable_banking":
+        return []
     return await MockBankingProvider().get_transactions("mock-account-1")
+
 @router.post("/banking/connections/authorize")
-async def bank_authorize(m=Depends(current_membership)):
-    provider=EnableBankingProvider() if settings.banking_provider=="enable_banking" else MockBankingProvider()
-    try: return {"authorization_url":await provider.create_authorization(settings.frontend_url+"/banking/callback")}
-    except NotImplementedError as exc: raise HTTPException(501,str(exc)) from exc
+async def bank_authorize(
+    payload: BankAuthorizeIn | None = None,
+    m: OrganizationMember = Depends(current_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    provider = EnableBankingProvider() if settings.banking_provider == "enable_banking" else MockBankingProvider()
+    aspsp_name = payload.aspsp_name if payload else None
+    aspsp_country = payload.aspsp_country if payload else None
+    if not aspsp_country:
+        org = await db.scalar(select(Organization).where(Organization.id == m.organization_id))
+        aspsp_country = org.country if org and org.country else "DK"
+    try:
+        url = await provider.create_authorization(
+            callback_url=settings.frontend_url + "/banking/callback",
+            aspsp_name=aspsp_name,
+            aspsp_country=aspsp_country,
+        )
+        return {"authorization_url": url}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to initiate bank authorization: {exc}") from exc
+
+@router.post("/banking/connections/callback")
+async def bank_callback(
+    payload: BankCallbackIn,
+    user: User = Depends(current_user),
+    m: OrganizationMember = Depends(current_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    provider = EnableBankingProvider() if settings.banking_provider == "enable_banking" else MockBankingProvider()
+    try:
+        session_data = await provider.handle_callback(payload.code)
+    except Exception as exc:
+        raise HTTPException(422, f"Failed to authorize bank session: {exc}") from exc
+
+    session_id = session_data.get("session_id") or payload.code
+    aspsp_info = session_data.get("aspsp") or {}
+    bank_name = aspsp_info.get("name") or "Connected Bank"
+
+    conn = BankConnection(
+        organization_id=m.organization_id,
+        provider=settings.banking_provider,
+        provider_reference=session_id,
+        status="connected",
+        last_synced_at=datetime.now(timezone.utc),
+    )
+    db.add(conn)
+    await db.flush()
+
+    raw_accounts = session_data.get("accounts", [])
+    if not raw_accounts:
+        try:
+            raw_accounts = await provider.get_accounts(session_id)
+        except Exception:
+            raw_accounts = []
+
+    connected_accounts = []
+    for acc in raw_accounts:
+        uid = str(acc.get("uid") or acc.get("id") or uuid4())
+        acc_dict = acc.get("account_id") or {}
+        iban = acc_dict.get("iban") or acc.get("masked_number") or ""
+        masked = f"•••• {iban[-4:]}" if len(iban) >= 4 else (acc.get("masked_number") or "•••• 0000")
+        name = acc.get("name") or acc.get("details") or "Business Account"
+
+        try:
+            balances = await provider.get_balances(uid)
+            balance = balances[0]["amount"] if balances else Decimal("0.00")
+            curr = balances[0]["currency"] if balances else (acc.get("currency") or "DKK")
+        except Exception:
+            balance = Decimal("0.00")
+            curr = acc.get("currency") or "DKK"
+
+        bank_acc = BankAccount(
+            organization_id=m.organization_id,
+            connection_id=conn.id,
+            provider_account_id=uid,
+            name=name[:150],
+            bank_name=bank_name[:150],
+            masked_number=masked[:40],
+            currency=curr[:3].upper(),
+            balance=balance,
+            last_synced_at=datetime.now(timezone.utc),
+        )
+        db.add(bank_acc)
+        await db.flush()
+        connected_accounts.append(bank_acc)
+
+        try:
+            txs = await provider.get_transactions(uid)
+            for t in txs:
+                db.add(BankTransaction(
+                    organization_id=m.organization_id,
+                    account_id=bank_acc.id,
+                    provider_transaction_id=str(t["id"])[:200],
+                    booked_at=t["booked_at"],
+                    description=str(t["description"])[:300],
+                    counterparty=str(t["counterparty"])[:200] if t.get("counterparty") else None,
+                    amount=t["amount"],
+                    currency=str(t["currency"])[:3].upper(),
+                    reference=str(t["reference"])[:200] if t.get("reference") else None,
+                ))
+        except Exception:
+            pass
+
+    db.add(AuditLog(
+        organization_id=m.organization_id,
+        user_id=user.id,
+        action="bank.connected",
+        entity_type="bank_connection",
+        entity_id=conn.id,
+        new_values={"provider": settings.banking_provider, "accounts_count": len(connected_accounts)},
+    ))
+    await db.commit()
+
+    return {
+        "status": "connected",
+        "accounts_count": len(connected_accounts),
+        "accounts": [
+            {
+                "id": str(a.id),
+                "name": a.name,
+                "bank": a.bank_name,
+                "masked_number": a.masked_number,
+                "currency": a.currency,
+                "balance": str(a.balance),
+            }
+            for a in connected_accounts
+        ],
+    }
+
+@router.post("/banking/sync")
+async def bank_sync(m: OrganizationMember = Depends(current_membership), db: AsyncSession = Depends(get_db)):
+    provider = EnableBankingProvider() if settings.banking_provider == "enable_banking" else MockBankingProvider()
+    result = await db.execute(select(BankAccount).where(BankAccount.organization_id == m.organization_id))
+    accounts = result.scalars().all()
+    now = datetime.now(timezone.utc)
+    synced_tx_count = 0
+    for a in accounts:
+        try:
+            balances = await provider.get_balances(a.provider_account_id)
+            if balances:
+                a.balance = balances[0]["amount"]
+            a.last_synced_at = now
+            txs = await provider.get_transactions(a.provider_account_id)
+            for t in txs:
+                exists = await db.scalar(
+                    select(BankTransaction)
+                    .where(BankTransaction.account_id == a.id)
+                    .where(BankTransaction.provider_transaction_id == str(t["id"]))
+                )
+                if not exists:
+                    db.add(BankTransaction(
+                        organization_id=m.organization_id,
+                        account_id=a.id,
+                        provider_transaction_id=str(t["id"])[:200],
+                        booked_at=t["booked_at"],
+                        description=str(t["description"])[:300],
+                        counterparty=str(t["counterparty"])[:200] if t.get("counterparty") else None,
+                        amount=t["amount"],
+                        currency=str(t["currency"])[:3].upper(),
+                        reference=str(t["reference"])[:200] if t.get("reference") else None,
+                    ))
+                    synced_tx_count += 1
+        except Exception:
+            pass
+    await db.commit()
+    return {"status": "synced", "new_transactions": synced_tx_count}
+
 @router.get("/audit")
 async def audit(m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
     result=await db.execute(select(AuditLog).where(AuditLog.organization_id==m.organization_id).order_by(AuditLog.created_at.desc()).limit(100)); return result.scalars().all()

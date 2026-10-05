@@ -104,3 +104,9 @@ class InvoiceLineIn(BaseModel): description: str=Field(min_length=1,max_length=5
 class InvoiceIn(BaseModel): invoice_number: str; invoice_type: InvoiceType=InvoiceType.outgoing; customer_id: UUID|None=None; supplier_id: UUID|None=None; issue_date: date; due_date: date; currency: str="DKK"; notes: str|None=None; lines: list[InvoiceLineIn]=Field(min_length=1)
 class InvoiceLineOut(ORMModel): id: UUID; description: str; quantity: Decimal; unit_price: Decimal; tax_rate: Decimal; line_total: Decimal
 class InvoiceOut(ORMModel): id: UUID; invoice_number: str; invoice_type: InvoiceType; status: InvoiceStatus; customer_id: UUID|None; supplier_id: UUID|None; issue_date: date; due_date: date; currency: str; subtotal: Decimal; tax_amount: Decimal; total: Decimal; notes: str|None; created_at: datetime
+class BankAuthorizeIn(BaseModel):
+    aspsp_name: str | None = None
+    aspsp_country: str | None = None
+class BankCallbackIn(BaseModel):
+    code: str
+
