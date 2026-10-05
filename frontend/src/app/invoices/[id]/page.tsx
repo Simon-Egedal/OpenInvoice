@@ -21,6 +21,8 @@ import {
   InvoiceMatch,
   InvoicePayment,
   LinkableTransaction,
+  Organization,
+  Party,
 } from "@/lib/api";
 
 type Line = {
@@ -35,6 +37,8 @@ type Line = {
 export default function InvoiceDetail() {
   const { id } = useParams<{ id: string }>();
   const [invoice, setInvoice] = useState<Invoice | null>(null);
+  const [org, setOrg] = useState<Organization | null>(null);
+  const [party, setParty] = useState<Party | null>(null);
   const [lines, setLines] = useState<Line[]>([]);
   const [payments, setPayments] = useState<InvoicePayment[]>([]);
   const [matches, setMatches] = useState<InvoiceMatch[]>([]);
@@ -57,16 +61,32 @@ export default function InvoiceDetail() {
 
   const loadData = useCallback(async () => {
     try {
-      const [inv, lns, pmts, mtchs] = await Promise.all([
+      const [inv, lns, pmts, mtchs, orgs] = await Promise.all([
         api<Invoice>(`/invoices/${id}`),
         api<Line[]>(`/invoices/${id}/lines`).catch(() => []),
         api<InvoicePayment[]>(`/invoices/${id}/payments`).catch(() => []),
         api<InvoiceMatch[]>(`/invoices/${id}/matches`).catch(() => []),
+        api<Organization[]>("/organizations").catch(() => []),
       ]);
       setInvoice(inv);
       setLines(lns);
       setPayments(pmts);
       setMatches(mtchs);
+
+      if (orgs && orgs.length > 0) {
+        const found = inv.organization_id ? orgs.find((o) => o.id === inv.organization_id) : orgs[0];
+        setOrg(found || orgs[0]);
+      }
+
+      if (inv.customer_id) {
+        api<Party>(`/customers/${inv.customer_id}`)
+          .then(setParty)
+          .catch(() => {});
+      } else if (inv.supplier_id) {
+        api<Party>(`/suppliers/${inv.supplier_id}`)
+          .then(setParty)
+          .catch(() => {});
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load invoice");
     }
@@ -203,6 +223,26 @@ export default function InvoiceDetail() {
   }
 
   const isFullyPaid = Number(invoice.due_amount) <= 0;
+  const orgDisplayName = invoice.organization_name || org?.name || "Organization";
+  const orgLogoUrl = invoice.organization_logo_url
+    ? `${API}/api/v1${invoice.organization_logo_url}`
+    : org?.logo_key
+    ? `${API}/api/v1/organizations/${org.id}/logo`
+    : null;
+
+  const activeRecipient = party || invoice.recipient || (invoice.recipient_name ? {
+    id: invoice.customer_id || invoice.supplier_id || "",
+    name: invoice.recipient_name,
+    email: invoice.recipient_email || null,
+    phone: invoice.recipient_phone || null,
+    address: invoice.recipient_address || null,
+    postal_code: invoice.recipient_postal_code || null,
+    city: invoice.recipient_city || null,
+    country: invoice.recipient_country || "DK",
+    vat_number: invoice.recipient_vat_number || null,
+    payment_information: null,
+    notes: null,
+  } : null);
 
   return (
     <div className="page">
@@ -272,6 +312,105 @@ export default function InvoiceDetail() {
         </div>
       </header>
 
+      {/* Organization and Recipient Branding Card */}
+      <div
+        className="invoice-org-card"
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          justifyContent: "space-between",
+          padding: "20px 24px",
+          background: "#fff",
+          border: "1px solid var(--line)",
+          borderRadius: "var(--radius)",
+          marginBottom: 20,
+          gap: 20,
+          flexWrap: "wrap",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 14 }}>
+          {orgLogoUrl ? (
+            <img
+              src={orgLogoUrl}
+              alt={orgDisplayName}
+              style={{
+                width: 48,
+                height: 48,
+                objectFit: "contain",
+                borderRadius: 4,
+                background: "#fff",
+                border: "1px solid var(--line)",
+                padding: 3,
+              }}
+            />
+          ) : (
+            <div
+              style={{
+                width: 48,
+                height: 48,
+                borderRadius: 4,
+                background: "var(--accent-wash)",
+                color: "var(--accent)",
+                display: "grid",
+                placeItems: "center",
+                fontWeight: 700,
+                fontSize: 18,
+                border: "1px solid var(--line)",
+                flexShrink: 0,
+              }}
+            >
+              {(orgDisplayName[0] || "O").toUpperCase()}
+            </div>
+          )}
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 600, color: "var(--ink)", letterSpacing: "-0.2px" }}>
+              {orgDisplayName}
+            </div>
+            <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+              {invoice.invoice_type === "outgoing" ? "Issuer" : "Recipient organization"}
+              {org?.country ? ` · ${org.country}` : ""}
+            </div>
+          </div>
+        </div>
+
+        {activeRecipient && (
+          <div style={{ textAlign: "right", maxWidth: 320 }}>
+            <div style={{ fontSize: 10, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 700, marginBottom: 4 }}>
+              {invoice.invoice_type === "outgoing" ? "Billed to (Recipient)" : "Supplier"}
+            </div>
+            <div style={{ fontSize: 14, fontWeight: 600, color: "var(--ink)" }}>
+              {activeRecipient.name}
+            </div>
+            {activeRecipient.address && (
+              <div style={{ fontSize: 12, color: "#424a45", marginTop: 2 }}>
+                {activeRecipient.address}
+              </div>
+            )}
+            {(activeRecipient.postal_code || activeRecipient.city || activeRecipient.country) && (
+              <div style={{ fontSize: 12, color: "#424a45" }}>
+                {[activeRecipient.postal_code, activeRecipient.city].filter(Boolean).join(" ")}
+                {activeRecipient.country ? `, ${activeRecipient.country}` : ""}
+              </div>
+            )}
+            {activeRecipient.vat_number && (
+              <div className="mono" style={{ fontSize: 11, color: "var(--muted)", marginTop: 3 }}>
+                VAT: {activeRecipient.vat_number}
+              </div>
+            )}
+            {activeRecipient.email && (
+              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+                {activeRecipient.email}
+              </div>
+            )}
+            {activeRecipient.phone && (
+              <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 1 }}>
+                {activeRecipient.phone}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       {error && (
         <p className="error-text" role="alert" style={{ marginBottom: 16 }}>
           {error}
@@ -313,6 +452,60 @@ export default function InvoiceDetail() {
       </div>
 
       <div className="detail-grid">
+        <div>
+          <div className="detail-label">Organization</div>
+          <div className="detail-value" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {orgLogoUrl ? (
+              <img
+                src={orgLogoUrl}
+                alt=""
+                style={{ width: 16, height: 16, objectFit: "contain", borderRadius: 2 }}
+              />
+            ) : (
+              <span
+                style={{
+                  display: "inline-block",
+                  width: 14,
+                  height: 14,
+                  borderRadius: 2,
+                  background: "var(--accent-wash)",
+                  color: "var(--accent)",
+                  fontSize: 9,
+                  fontWeight: 700,
+                  textAlign: "center",
+                  lineHeight: "14px",
+                }}
+              >
+                {(orgDisplayName[0] || "O").toUpperCase()}
+              </span>
+            )}
+            <span>{orgDisplayName}</span>
+          </div>
+        </div>
+        <div>
+          <div className="detail-label">
+            {invoice.invoice_type === "outgoing" ? "Recipient" : "Supplier"}
+          </div>
+          <div className="detail-value">
+            {activeRecipient ? (
+              <div>
+                <div style={{ fontWeight: 600 }}>{activeRecipient.name}</div>
+                {(activeRecipient.address || activeRecipient.city || activeRecipient.country) && (
+                  <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2 }}>
+                    {[activeRecipient.address, activeRecipient.postal_code, activeRecipient.city, activeRecipient.country].filter(Boolean).join(", ")}
+                  </div>
+                )}
+                {activeRecipient.vat_number && (
+                  <div className="mono" style={{ fontSize: 11, color: "var(--muted)", marginTop: 1 }}>
+                    VAT: {activeRecipient.vat_number}
+                  </div>
+                )}
+              </div>
+            ) : (
+              "—"
+            )}
+          </div>
+        </div>
         <div>
           <div className="detail-label">Issue date</div>
           <div className="detail-value">{invoice.issue_date}</div>

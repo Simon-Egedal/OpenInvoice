@@ -53,6 +53,63 @@ class BankingProvider(ABC):
 
 
 class MockBankingProvider(BankingProvider):
+    _initial_balance = Decimal("48250.00")
+    _sync_pool = [
+        ("Customer payment - Inv 2026-0055", "Nordic Solutions ApS", Decimal("5250.00"), "2026-0055"),
+        ("Software subscription", "GitHub Inc.", Decimal("-320.00"), None),
+        ("Consulting retainer", "København Media Group", Decimal("12800.00"), "2026-0060"),
+        ("Office supplies & coffee", "Kaffebaren ApS", Decimal("-450.00"), None),
+        ("Invoice 2026-0072 settlement", "Aarhus Design Lab", Decimal("7400.00"), "2026-0072"),
+        ("Telecom & internet", "TDC Net", Decimal("-899.00"), None),
+        ("Marketing campaign", "Google Ads", Decimal("-1500.00"), None),
+        ("Client payment - Inv 2026-0081", "Odense Logistics", Decimal("9200.00"), "2026-0081"),
+    ]
+    _account_states: dict[str, dict] = {}
+
+    @classmethod
+    def reset_state(cls):
+        cls._account_states = {}
+
+    def _get_account_state(self, account_id: str, current_balance: Decimal | None = None) -> dict:
+        key = str(account_id or "mock-account-1")
+        if key not in self._account_states:
+            init_bal = current_balance if current_balance is not None else self._initial_balance
+            self._account_states[key] = {
+                "balance": init_bal,
+                "synced_count": 0,
+                "extra_transactions": [],
+            }
+        elif current_balance is not None:
+            self._account_states[key]["balance"] = current_balance
+        return self._account_states[key]
+
+    async def advance_mock_sync(self, account_id: str, current_balance: Decimal | None = None) -> dict:
+        state = self._get_account_state(account_id, current_balance)
+        count = state["synced_count"]
+        now = datetime.now(timezone.utc)
+        if count < len(self._sync_pool):
+            d, p, a, ref = self._sync_pool[count]
+        else:
+            idx = count + 1
+            if idx % 2 == 1:
+                d, p, a, ref = (f"Client payment - Inv 2026-{100 + idx}", "Danmark Business Partner ApS", Decimal("3500.00"), f"2026-{100 + idx}")
+            else:
+                d, p, a, ref = (f"Operational expense #{idx}", "Kontor & Service ApS", Decimal("-650.00"), None)
+
+        new_tx = {
+            "id": f"mock-tx-{4 + count}",
+            "booked_at": now,
+            "description": d,
+            "counterparty": p,
+            "amount": a,
+            "currency": "DKK",
+            "reference": ref,
+        }
+        state["extra_transactions"].append(new_tx)
+        state["balance"] += a
+        state["synced_count"] += 1
+        return new_tx
+
     async def get_aspsps(self, country: str = "DK") -> list[dict]:
         return [
             {"name": "Nordic Bank (demo)", "country": country.upper(), "logo": None, "psu_types": ["personal", "business"]}
@@ -99,11 +156,12 @@ class MockBankingProvider(BankingProvider):
         }
 
     async def get_balances(self, account_id: str) -> list[dict]:
-        return [{"amount": Decimal("48250.00"), "currency": "DKK", "name": "Booked balance"}]
+        state = self._get_account_state(account_id)
+        return [{"amount": state["balance"], "currency": "DKK", "name": "Booked balance"}]
 
     async def get_transactions(self, account_id: str) -> list[dict]:
         now = datetime.now(timezone.utc)
-        return [
+        base = [
             {
                 "id": f"mock-tx-{i}",
                 "booked_at": now - timedelta(days=i * 3),
@@ -122,6 +180,9 @@ class MockBankingProvider(BankingProvider):
                 1,
             )
         ]
+        state = self._get_account_state(account_id)
+        extras = list(reversed(state["extra_transactions"]))
+        return extras + base
 
     async def disconnect(self, connection_id: str) -> None:
         return None
@@ -283,13 +344,35 @@ class EnableBankingProvider(BankingProvider):
 
     async def get_balances(self, account_id: str) -> list[dict]:
         data = await asyncio.to_thread(self._sync_request, "GET", f"/accounts/{account_id}/balances")
-        raw_balances = data.get("balances", []) if isinstance(data, dict) else []
+        raw_balances = []
+        if isinstance(data, dict):
+            raw_balances = data.get("balances", [])
+            if not raw_balances and ("balance_amount" in data or "amount" in data):
+                raw_balances = [data]
+        elif isinstance(data, list):
+            raw_balances = data
+
         results = []
         for b in raw_balances:
-            amt_info = b.get("balance_amount") or {}
-            amt = Decimal(str(amt_info.get("amount", "0")))
-            curr = amt_info.get("currency", "DKK")
-            results.append({"amount": amt, "currency": curr, "name": b.get("name", "Current balance")})
+            if not isinstance(b, dict):
+                continue
+            amt_info = b.get("balance_amount") or b.get("balanceAmount") or b
+            if isinstance(amt_info, dict):
+                amt_str = str(
+                    amt_info.get("amount")
+                    if amt_info.get("amount") is not None
+                    else amt_info.get("value", "0")
+                )
+                curr = amt_info.get("currency") or b.get("currency", "DKK")
+            else:
+                amt_str = str(amt_info)
+                curr = b.get("currency", "DKK")
+            try:
+                amt = Decimal(amt_str)
+            except Exception:
+                amt = Decimal("0.00")
+            name = b.get("name") or b.get("balance_type") or b.get("balanceType") or "Current balance"
+            results.append({"amount": amt, "currency": str(curr).upper()[:3], "name": str(name)})
         return results
 
     async def get_transactions(self, account_id: str) -> list[dict]:

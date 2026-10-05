@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from io import BytesIO
 from uuid import UUID
@@ -6,7 +6,9 @@ import asyncio
 import smtplib
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import StreamingResponse
+from PIL import Image
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.engine import URL
@@ -504,16 +506,84 @@ async def update_supplier(item_id:UUID,payload:SupplierIn,m=Depends(write_member
     for key,value in payload.model_dump().items(): setattr(item,key,value)
     await db.commit(); await db.refresh(item); return item
 
+async def attach_organization_metadata(db: AsyncSession, invoice: Invoice) -> Invoice:
+    try:
+        org = await db.scalar(select(Organization).where(Organization.id == invoice.organization_id))
+        if org:
+            setattr(invoice, "organization_name", org.name)
+            setattr(invoice, "organization_logo_url", f"/organizations/{org.id}/logo" if org.logo_key else None)
+        recipient = None
+        if invoice.customer_id:
+            recipient = await db.scalar(select(Customer).where(Customer.id == invoice.customer_id, Customer.organization_id == invoice.organization_id))
+        elif invoice.supplier_id:
+            recipient = await db.scalar(select(Supplier).where(Supplier.id == invoice.supplier_id, Supplier.organization_id == invoice.organization_id))
+        if recipient:
+            setattr(invoice, "recipient_name", recipient.name)
+            setattr(invoice, "recipient_email", recipient.email)
+            setattr(invoice, "recipient_phone", recipient.phone)
+            setattr(invoice, "recipient_address", recipient.address)
+            setattr(invoice, "recipient_postal_code", recipient.postal_code)
+            setattr(invoice, "recipient_city", recipient.city)
+            setattr(invoice, "recipient_country", recipient.country)
+            setattr(invoice, "recipient_vat_number", recipient.vat_number)
+            setattr(invoice, "recipient", recipient)
+    except Exception:
+        pass
+    return invoice
+
+async def attach_organization_metadata_list(db: AsyncSession, invoices: list[Invoice], organization_id: UUID) -> list[Invoice]:
+    try:
+        org = await db.scalar(select(Organization).where(Organization.id == organization_id))
+        logo_url = f"/organizations/{org.id}/logo" if (org and org.logo_key) else None
+        org_name = org.name if org else None
+
+        cust_ids = {inv.customer_id for inv in invoices if inv.customer_id}
+        supp_ids = {inv.supplier_id for inv in invoices if inv.supplier_id}
+
+        customers = {}
+        if cust_ids:
+            cust_res = await db.execute(select(Customer).where(Customer.id.in_(cust_ids), Customer.organization_id == organization_id))
+            customers = {c.id: c for c in cust_res.scalars().all()}
+
+        suppliers = {}
+        if supp_ids:
+            supp_res = await db.execute(select(Supplier).where(Supplier.id.in_(supp_ids), Supplier.organization_id == organization_id))
+            suppliers = {s.id: s for s in supp_res.scalars().all()}
+
+        for inv in invoices:
+            if org_name:
+                setattr(inv, "organization_name", org_name)
+            setattr(inv, "organization_logo_url", logo_url)
+            rec = customers.get(inv.customer_id) if inv.customer_id else suppliers.get(inv.supplier_id)
+            if rec:
+                setattr(inv, "recipient_name", rec.name)
+                setattr(inv, "recipient_email", rec.email)
+                setattr(inv, "recipient_phone", rec.phone)
+                setattr(inv, "recipient_address", rec.address)
+                setattr(inv, "recipient_postal_code", rec.postal_code)
+                setattr(inv, "recipient_city", rec.city)
+                setattr(inv, "recipient_country", rec.country)
+                setattr(inv, "recipient_vat_number", rec.vat_number)
+                setattr(inv, "recipient", rec)
+    except Exception:
+        pass
+    return invoices
+
 @router.get("/invoices",response_model=list[InvoiceOut])
 async def invoices(m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
-    result=await db.execute(select(Invoice).where(Invoice.organization_id==m.organization_id).order_by(Invoice.created_at.desc())); return result.scalars().all()
+    result=await db.execute(select(Invoice).where(Invoice.organization_id==m.organization_id).order_by(Invoice.created_at.desc()))
+    items = result.scalars().all()
+    await attach_organization_metadata_list(db, items, m.organization_id)
+    return items
 @router.post("/invoices",response_model=InvoiceOut,status_code=201)
 async def add_invoice(payload:InvoiceIn,user=Depends(current_user),m=Depends(write_membership),db:AsyncSession=Depends(get_db)):
     if payload.invoice_type.value=="outgoing":
         if not payload.customer_id or not await db.scalar(select(Customer.id).where(Customer.id==payload.customer_id,Customer.organization_id==m.organization_id)): raise HTTPException(422,"Choose a customer from this organization")
     if payload.invoice_type.value=="incoming":
         if not payload.supplier_id or not await db.scalar(select(Supplier.id).where(Supplier.id==payload.supplier_id,Supplier.organization_id==m.organization_id)): raise HTTPException(422,"Choose a supplier from this organization")
-    return await create_invoice(db,payload,m.organization_id,user.id)
+    invoice = await create_invoice(db,payload,m.organization_id,user.id)
+    await attach_organization_metadata(db, invoice)
+    return invoice
 @router.post("/invoices/receive",response_model=InvoiceOut,status_code=201)
 async def receive_invoice(user=Depends(current_user),m=Depends(write_membership),db:AsyncSession=Depends(get_db),invoice_number:str=Form(min_length=1,max_length=100),supplier_id:UUID=Form(),issue_date:date=Form(),due_date:date=Form(),description:str=Form(min_length=1,max_length=500),net_amount:Decimal=Form(gt=0),tax_rate:Decimal=Form(ge=0,le=100),currency:str=Form(default="DKK"),document:UploadFile=File()):
     if not await db.scalar(select(Supplier.id).where(Supplier.id==supplier_id,Supplier.organization_id==m.organization_id)): raise HTTPException(422,"Choose a supplier from this organization")
@@ -526,7 +596,9 @@ async def receive_invoice(user=Depends(current_user),m=Depends(write_membership)
     key=await storage_provider().put(content,safe_name,"application/pdf")
     amount=money(net_amount); tax=money(amount*tax_rate/Decimal("100"))
     invoice=Invoice(organization_id=m.organization_id,created_by=user.id,invoice_number=invoice_number,invoice_type=InvoiceType.incoming,status=InvoiceStatus.received,supplier_id=supplier_id,issue_date=issue_date,due_date=due_date,currency=currency.upper(),subtotal=amount,tax_amount=tax,total=money(amount+tax))
-    db.add(invoice); await db.flush(); db.add(InvoiceLine(invoice_id=invoice.id,description=description,quantity=Decimal("1"),unit_price=amount,tax_rate=tax_rate,line_total=amount)); db.add(InvoiceDocument(organization_id=m.organization_id,invoice_id=invoice.id,storage_key=key,original_filename=safe_name,content_type="application/pdf",size_bytes=len(content))); db.add(AuditLog(organization_id=m.organization_id,user_id=user.id,action="invoice.received",entity_type="invoice",entity_id=invoice.id,new_values={"invoice_number":invoice_number,"document_name":safe_name})); await db.commit(); await db.refresh(invoice); return invoice
+    db.add(invoice); await db.flush(); db.add(InvoiceLine(invoice_id=invoice.id,description=description,quantity=Decimal("1"),unit_price=amount,tax_rate=tax_rate,line_total=amount)); db.add(InvoiceDocument(organization_id=m.organization_id,invoice_id=invoice.id,storage_key=key,original_filename=safe_name,content_type="application/pdf",size_bytes=len(content))); db.add(AuditLog(organization_id=m.organization_id,user_id=user.id,action="invoice.received",entity_type="invoice",entity_id=invoice.id,new_values={"invoice_number":invoice_number,"document_name":safe_name})); await db.commit(); await db.refresh(invoice)
+    await attach_organization_metadata(db, invoice)
+    return invoice
 @router.patch("/invoices/{invoice_id}",response_model=InvoiceOut)
 async def update_draft_invoice(invoice_id:UUID,payload:InvoiceIn,user=Depends(current_user),m=Depends(write_membership),db:AsyncSession=Depends(get_db)):
     invoice=await db.scalar(select(Invoice).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id))
@@ -544,35 +616,201 @@ async def update_draft_invoice(invoice_id:UUID,payload:InvoiceIn,user=Depends(cu
     await db.execute(delete(InvoiceLine).where(InvoiceLine.invoice_id==invoice.id))
     for line,amount in prepared: db.add(InvoiceLine(invoice_id=invoice.id,description=line.description,quantity=line.quantity,unit_price=line.unit_price,tax_rate=line.tax_rate,line_total=amount))
     db.add(AuditLog(organization_id=m.organization_id,user_id=user.id,action="invoice.updated",entity_type="invoice",entity_id=invoice.id,new_values={"invoice_number":invoice.invoice_number,"total":str(invoice.total)}))
-    await db.commit(); await db.refresh(invoice); return invoice
+    await db.commit(); await db.refresh(invoice)
+    await attach_organization_metadata(db, invoice)
+    return invoice
 @router.get("/invoices/{invoice_id}",response_model=InvoiceOut)
 async def get_invoice(invoice_id:UUID,m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
-    invoice=await db.scalar(select(Invoice).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id));
+    invoice=await db.scalar(select(Invoice).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id))
     if not invoice: raise HTTPException(404,"Invoice not found")
+    await attach_organization_metadata(db, invoice)
     return invoice
 @router.get("/invoices/{invoice_id}/lines",response_model=list[InvoiceLineOut])
 async def invoice_lines(invoice_id:UUID,m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
     if not await db.scalar(select(Invoice.id).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id)): raise HTTPException(404,"Invoice not found")
     result=await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==invoice_id)); return result.scalars().all()
-def make_pdf(invoice,lines):
-    out=BytesIO(); doc=canvas.Canvas(out,pagesize=A4); width,height=A4; y=height-60
-    doc.setFillColorRGB(.1,.12,.14); doc.setFont("Helvetica-Bold",22); doc.drawString(48,y,"INVOICE"); y-=35
-    doc.setFont("Helvetica-Bold",13); doc.drawString(48,y,invoice.invoice_number); y-=24
-    doc.setFont("Helvetica",10); doc.drawString(48,y,f"Issue date  {invoice.issue_date}     Due date  {invoice.due_date}"); y-=42
-    doc.setFont("Helvetica-Bold",10); doc.drawString(48,y,"DESCRIPTION"); doc.drawRightString(width-160,y,"QTY"); doc.drawRightString(width-90,y,"PRICE"); doc.drawRightString(width-48,y,"TOTAL"); y-=10; doc.line(48,y,width-48,y); y-=20
-    doc.setFont("Helvetica",10)
+def make_pdf(invoice, lines, org=None, logo_bytes=None, org_name=None, recipient=None):
+    if org_name is None:
+        if org is not None and getattr(org, "name", None):
+            org_name = org.name
+        elif getattr(invoice, "organization_name", None):
+            org_name = invoice.organization_name
+
+    recipient_name = None
+    recipient_address = None
+    recipient_city_line = None
+    recipient_vat = None
+    recipient_email = None
+    recipient_phone = None
+
+    if recipient is not None:
+        if isinstance(recipient, dict):
+            recipient_name = recipient.get("name")
+            recipient_address = recipient.get("address")
+            postal = recipient.get("postal_code") or ""
+            city = recipient.get("city") or ""
+            country = recipient.get("country") or ""
+            city_part = f"{postal} {city}".strip()
+            recipient_city_line = ", ".join(filter(None, [city_part, country])) or None
+            recipient_vat = recipient.get("vat_number")
+            recipient_email = recipient.get("email")
+            recipient_phone = recipient.get("phone")
+        else:
+            recipient_name = getattr(recipient, "name", None)
+            recipient_address = getattr(recipient, "address", None)
+            postal = getattr(recipient, "postal_code", None) or ""
+            city = getattr(recipient, "city", None) or ""
+            country = getattr(recipient, "country", None) or ""
+            city_part = f"{postal} {city}".strip()
+            recipient_city_line = ", ".join(filter(None, [city_part, country])) or None
+            recipient_vat = getattr(recipient, "vat_number", None)
+            recipient_email = getattr(recipient, "email", None)
+            recipient_phone = getattr(recipient, "phone", None)
+    elif getattr(invoice, "recipient_name", None):
+        recipient_name = getattr(invoice, "recipient_name", None)
+        recipient_address = getattr(invoice, "recipient_address", None)
+        postal = getattr(invoice, "recipient_postal_code", None) or ""
+        city = getattr(invoice, "recipient_city", None) or ""
+        country = getattr(invoice, "recipient_country", None) or ""
+        city_part = f"{postal} {city}".strip()
+        recipient_city_line = ", ".join(filter(None, [city_part, country])) or None
+        recipient_vat = getattr(invoice, "recipient_vat_number", None)
+        recipient_email = getattr(invoice, "recipient_email", None)
+        recipient_phone = getattr(invoice, "recipient_phone", None)
+
+    out = BytesIO()
+    doc = canvas.Canvas(out, pagesize=A4, pageCompression=0)
+    width, height = A4
+    y = height - 60
+
+    doc.setFillColorRGB(.1, .12, .14)
+    doc.setFont("Helvetica-Bold", 22)
+    doc.drawString(48, y, "INVOICE")
+    y -= 35
+    doc.setFont("Helvetica-Bold", 13)
+    doc.drawString(48, y, invoice.invoice_number)
+    y -= 24
+    doc.setFont("Helvetica", 10)
+    doc.drawString(48, y, f"Issue date  {invoice.issue_date}     Due date  {invoice.due_date}")
+
+    # Draw Organization Logo and Name on top right
+    right_x = width - 48
+    top_y = height - 48
+    rendered_logo = False
+
+    if logo_bytes:
+        try:
+            pil_img = Image.open(BytesIO(logo_bytes))
+            orig_w, orig_h = pil_img.size
+            if orig_w > 0 and orig_h > 0:
+                max_w, max_h = 140, 50
+                aspect = orig_w / orig_h
+                if orig_w / max_w > orig_h / max_h:
+                    img_w = max_w
+                    img_h = max_w / aspect
+                else:
+                    img_h = max_h
+                    img_w = max_h * aspect
+                img_x = right_x - img_w
+                img_y = top_y - img_h
+                doc.drawImage(ImageReader(pil_img), img_x, img_y, width=img_w, height=img_h, mask='auto', preserveAspectRatio=True)
+                rendered_logo = True
+                if org_name:
+                    doc.setFont("Helvetica-Bold", 12)
+                    doc.setFillColorRGB(.1, .12, .14)
+                    doc.drawRightString(right_x, img_y - 15, str(org_name)[:50])
+        except Exception:
+            rendered_logo = False
+
+    if not rendered_logo and org_name:
+        doc.setFont("Helvetica-Bold", 16)
+        doc.setFillColorRGB(.1, .12, .14)
+        doc.drawRightString(right_x, height - 60, str(org_name)[:50])
+
+    inv_type = getattr(invoice, "invoice_type", "outgoing")
+    if hasattr(inv_type, "value"):
+        inv_type = inv_type.value
+    recipient_label = "BILLED TO" if inv_type == "outgoing" else "SUPPLIER"
+
+    if recipient_name:
+        y -= 26
+        doc.setFont("Helvetica-Bold", 8)
+        doc.setFillColorRGB(.45, .48, .46)
+        doc.drawString(48, y, recipient_label)
+        y -= 14
+
+        doc.setFont("Helvetica-Bold", 11)
+        doc.setFillColorRGB(.1, .12, .14)
+        doc.drawString(48, y, str(recipient_name)[:60])
+        y -= 13
+
+        doc.setFont("Helvetica", 9)
+        doc.setFillColorRGB(.3, .33, .31)
+        if recipient_address:
+            doc.drawString(48, y, str(recipient_address)[:60])
+            y -= 12
+        if recipient_city_line:
+            doc.drawString(48, y, str(recipient_city_line)[:60])
+            y -= 12
+        if recipient_vat:
+            doc.drawString(48, y, f"VAT: {recipient_vat}"[:40])
+            y -= 12
+        contact_parts = list(filter(None, [recipient_email, recipient_phone]))
+        if contact_parts:
+            doc.drawString(48, y, " · ".join(contact_parts)[:60])
+            y -= 12
+        y -= 16
+    else:
+        y -= 42
+
+    doc.setFont("Helvetica-Bold", 10)
+    doc.setFillColorRGB(.1, .12, .14)
+    doc.drawString(48, y, "DESCRIPTION")
+    doc.drawRightString(width - 160, y, "QTY")
+    doc.drawRightString(width - 90, y, "PRICE")
+    doc.drawRightString(width - 48, y, "TOTAL")
+    y -= 10
+    doc.line(48, y, width - 48, y)
+    y -= 20
+    doc.setFont("Helvetica", 10)
     for line in lines:
-        doc.drawString(48,y,line.description[:70]); doc.drawRightString(width-160,y,str(line.quantity)); doc.drawRightString(width-90,y,f"{line.unit_price:.2f}"); doc.drawRightString(width-48,y,f"{line.line_total:.2f}"); y-=22
-    y-=10; doc.line(width-220,y,width-48,y); y-=22
-    for label,value in (("Subtotal",invoice.subtotal),("VAT",invoice.tax_amount),("Total",invoice.total)):
-        doc.setFont("Helvetica-Bold" if label=="Total" else "Helvetica",11 if label=="Total" else 10); doc.drawString(width-220,y,label); doc.drawRightString(width-48,y,f"{invoice.currency} {value:.2f}"); y-=22
-    if invoice.notes: y-=15; doc.setFont("Helvetica",9); doc.drawString(48,y,"Notes: "+invoice.notes[:100])
-    doc.save(); return out.getvalue()
+        doc.drawString(48, y, line.description[:70])
+        doc.drawRightString(width - 160, y, str(line.quantity))
+        doc.drawRightString(width - 90, y, f"{line.unit_price:.2f}")
+        doc.drawRightString(width - 48, y, f"{line.line_total:.2f}")
+        y -= 22
+    y -= 10
+    doc.line(width - 220, y, width - 48, y)
+    y -= 22
+    for label, value in (("Subtotal", invoice.subtotal), ("VAT", invoice.tax_amount), ("Total", invoice.total)):
+        doc.setFont("Helvetica-Bold" if label == "Total" else "Helvetica", 11 if label == "Total" else 10)
+        doc.drawString(width - 220, y, label)
+        doc.drawRightString(width - 48, y, f"{invoice.currency} {value:.2f}")
+        y -= 22
+    if invoice.notes:
+        y -= 15
+        doc.setFont("Helvetica", 9)
+        doc.drawString(48, y, "Notes: " + invoice.notes[:100])
+    doc.save()
+    return out.getvalue()
 @router.get("/invoices/{invoice_id}/pdf")
 async def invoice_pdf(invoice_id:UUID,m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
-    invoice=await db.scalar(select(Invoice).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id));
+    invoice=await db.scalar(select(Invoice).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id))
     if not invoice: raise HTTPException(404,"Invoice not found")
-    result=await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==invoice_id)); return StreamingResponse(BytesIO(make_pdf(invoice,result.scalars().all())),media_type="application/pdf",headers={"Content-Disposition":f'attachment; filename="{invoice.invoice_number}.pdf"'})
+    result=await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==invoice_id))
+    org=await db.scalar(select(Organization).where(Organization.id==invoice.organization_id))
+    logo_bytes = None
+    if org and org.logo_key:
+        try:
+            logo_bytes = await storage_provider().get(org.logo_key)
+        except Exception:
+            logo_bytes = None
+    recipient = None
+    if invoice.customer_id:
+        recipient = await db.scalar(select(Customer).where(Customer.id == invoice.customer_id, Customer.organization_id == m.organization_id))
+    elif invoice.supplier_id:
+        recipient = await db.scalar(select(Supplier).where(Supplier.id == invoice.supplier_id, Supplier.organization_id == m.organization_id))
+    return StreamingResponse(BytesIO(make_pdf(invoice,result.scalars().all(),org=org,logo_bytes=logo_bytes,recipient=recipient)),media_type="application/pdf",headers={"Content-Disposition":f'attachment; filename="{invoice.invoice_number}.pdf"'})
 @router.post("/invoices/{invoice_id}/send",status_code=202)
 async def send_invoice(invoice_id:UUID,user=Depends(current_user),m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
     invoice=await db.scalar(select(Invoice).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id))
@@ -580,7 +818,15 @@ async def send_invoice(invoice_id:UUID,user=Depends(current_user),m=Depends(curr
     if not invoice.customer_id: raise HTTPException(422,"Invoice has no customer")
     customer=await db.scalar(select(Customer).where(Customer.id==invoice.customer_id,Customer.organization_id==m.organization_id))
     if not customer or not customer.email: raise HTTPException(422,"Customer has no email address")
-    rows=await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==invoice.id)); pdf=make_pdf(invoice,rows.scalars().all())
+    rows=await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==invoice.id))
+    org=await db.scalar(select(Organization).where(Organization.id==invoice.organization_id))
+    logo_bytes = None
+    if org and org.logo_key:
+        try:
+            logo_bytes = await storage_provider().get(org.logo_key)
+        except Exception:
+            logo_bytes = None
+    pdf=make_pdf(invoice,rows.scalars().all(),org=org,logo_bytes=logo_bytes,recipient=customer)
     delivery=EmailDelivery(organization_id=m.organization_id,invoice_id=invoice.id,recipient=customer.email,status="sending"); db.add(delivery); await db.flush()
     try:
         delivery.provider_message_id=await email_provider().send_invoice(customer.email,f"Invoice {invoice.invoice_number}",f"Please find invoice {invoice.invoice_number} attached.",pdf,f"{invoice.invoice_number}.pdf"); delivery.status="sent"; delivery.sent_at=datetime.now(timezone.utc); invoice.status=InvoiceStatus.sent
@@ -1060,15 +1306,88 @@ async def bank_callback(
 async def bank_sync(m: OrganizationMember = Depends(current_membership), db: AsyncSession = Depends(get_db)):
     provider = EnableBankingProvider() if settings.banking_provider == "enable_banking" else MockBankingProvider()
     result = await db.execute(select(BankAccount).where(BankAccount.organization_id == m.organization_id))
-    accounts = result.scalars().all()
+    accounts = list(result.scalars().all())
     now = datetime.now(timezone.utc)
     synced_tx_count = 0
+
+    if not accounts and settings.banking_provider != "enable_banking":
+        conn = BankConnection(
+            organization_id=m.organization_id,
+            provider="mock",
+            provider_reference="mock-session-demo",
+            status="connected",
+            last_synced_at=now,
+        )
+        db.add(conn)
+        await db.flush()
+        demo_acc = BankAccount(
+            organization_id=m.organization_id,
+            connection_id=conn.id,
+            provider_account_id="mock-account-1",
+            name="Business account",
+            bank_name="Nordic Bank (demo)",
+            masked_number="•••• 4821",
+            currency="DKK",
+            balance=Decimal("48250.00"),
+            last_synced_at=now,
+        )
+        db.add(demo_acc)
+        await db.flush()
+        initial_txs = [
+            ("mock-tx-1", now - timedelta(days=9), "Invoice 2026-0042", "Acme ApS", Decimal("4995.00"), "DKK", "2026-0042"),
+            ("mock-tx-2", now - timedelta(days=6), "Office supplies", "Paper Shop", Decimal("-842.50"), "DKK", None),
+            ("mock-tx-3", now - timedelta(days=3), "Cloud hosting", "Example Cloud", Decimal("-1299.00"), "DKK", None),
+        ]
+        for tx_id, booked_at, desc, cp, amt, curr, ref in initial_txs:
+            db.add(BankTransaction(
+                organization_id=m.organization_id,
+                account_id=demo_acc.id,
+                provider_transaction_id=tx_id,
+                booked_at=booked_at,
+                description=desc,
+                counterparty=cp,
+                amount=amt,
+                currency=curr,
+                reference=ref,
+            ))
+        await db.flush()
+        accounts = [demo_acc]
+
     for a in accounts:
+        # Advance mock provider if applicable so next transaction is generated
+        if hasattr(provider, "advance_mock_sync"):
+            try:
+                await provider.advance_mock_sync(a.provider_account_id, current_balance=a.balance)
+            except Exception:
+                pass
+
+        # 1. Fetch updated balance from provider
+        provider_balance: Decimal | None = None
         try:
             balances = await provider.get_balances(a.provider_account_id)
             if balances:
-                a.balance = balances[0]["amount"]
-            a.last_synced_at = now
+                chosen = None
+                for b in balances:
+                    name_lower = str(b.get("name", "")).lower()
+                    if any(k in name_lower for k in ["booked", "closing", "clbd"]):
+                        chosen = b
+                        break
+                if not chosen:
+                    for b in balances:
+                        name_lower = str(b.get("name", "")).lower()
+                        if any(k in name_lower for k in ["available", "itav"]):
+                            chosen = b
+                            break
+                if not chosen and balances:
+                    chosen = balances[0]
+                if chosen and "amount" in chosen:
+                    provider_balance = Decimal(str(chosen["amount"]))
+        except Exception:
+            pass
+
+        # 2. Fetch transactions from provider
+        new_tx_amount_sum = Decimal("0.00")
+        try:
             txs = await provider.get_transactions(a.provider_account_id)
             for t in txs:
                 exists = await db.scalar(
@@ -1077,6 +1396,7 @@ async def bank_sync(m: OrganizationMember = Depends(current_membership), db: Asy
                     .where(BankTransaction.provider_transaction_id == str(t["id"]))
                 )
                 if not exists:
+                    amt = Decimal(str(t["amount"]))
                     db.add(BankTransaction(
                         organization_id=m.organization_id,
                         account_id=a.id,
@@ -1084,15 +1404,40 @@ async def bank_sync(m: OrganizationMember = Depends(current_membership), db: Asy
                         booked_at=t["booked_at"],
                         description=str(t["description"])[:300],
                         counterparty=str(t["counterparty"])[:200] if t.get("counterparty") else None,
-                        amount=t["amount"],
+                        amount=amt,
                         currency=str(t["currency"])[:3].upper(),
                         reference=str(t["reference"])[:200] if t.get("reference") else None,
                     ))
                     synced_tx_count += 1
+                    new_tx_amount_sum += amt
         except Exception:
             pass
+
+        # 3. Update account balance
+        if provider_balance is not None:
+            a.balance = provider_balance
+        elif new_tx_amount_sum != Decimal("0.00"):
+            a.balance = a.balance + new_tx_amount_sum
+
+        a.last_synced_at = now
+
     await db.commit()
-    return {"status": "synced", "new_transactions": synced_tx_count}
+    return {
+        "status": "synced",
+        "new_transactions": synced_tx_count,
+        "accounts": [
+            {
+                "id": str(a.id),
+                "name": a.name,
+                "bank": a.bank_name,
+                "masked_number": a.masked_number,
+                "currency": a.currency,
+                "balance": str(a.balance),
+                "last_synced_at": a.last_synced_at.isoformat() if a.last_synced_at else None,
+            }
+            for a in accounts
+        ],
+    }
 
 @router.get("/audit")
 async def audit(m=Depends(current_membership),db:AsyncSession=Depends(get_db)):

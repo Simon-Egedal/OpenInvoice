@@ -7,6 +7,18 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 export type Invoice = {
   id: string;
+  organization_id?: string;
+  organization_name?: string | null;
+  organization_logo_url?: string | null;
+  recipient_name?: string | null;
+  recipient_email?: string | null;
+  recipient_phone?: string | null;
+  recipient_address?: string | null;
+  recipient_postal_code?: string | null;
+  recipient_city?: string | null;
+  recipient_country?: string | null;
+  recipient_vat_number?: string | null;
+  recipient?: Party | null;
   invoice_number: string;
   invoice_type: "incoming" | "outgoing";
   status: string;

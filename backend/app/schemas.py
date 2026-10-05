@@ -122,6 +122,18 @@ class InvoiceIn(BaseModel): invoice_number: str; invoice_type: InvoiceType=Invoi
 class InvoiceLineOut(ORMModel): id: UUID; description: str; quantity: Decimal; unit_price: Decimal; tax_rate: Decimal; line_total: Decimal
 class InvoiceOut(ORMModel):
     id: UUID
+    organization_id: UUID
+    organization_name: str | None = None
+    organization_logo_url: str | None = None
+    recipient_name: str | None = None
+    recipient_email: str | None = None
+    recipient_phone: str | None = None
+    recipient_address: str | None = None
+    recipient_postal_code: str | None = None
+    recipient_city: str | None = None
+    recipient_country: str | None = None
+    recipient_vat_number: str | None = None
+    recipient: CustomerOut | None = None
     invoice_number: str
     invoice_type: InvoiceType
     status: InvoiceStatus

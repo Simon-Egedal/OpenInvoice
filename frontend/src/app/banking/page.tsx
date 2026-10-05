@@ -115,10 +115,12 @@ export default function Banking() {
 
   async function handleRefresh() {
     setRefreshing(true);
+    setError("");
     try {
       await api("/banking/sync", { method: "POST" });
       await loadData();
-    } catch {
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to sync banking data");
       await loadData();
     } finally {
       setRefreshing(false);
@@ -196,14 +198,25 @@ export default function Banking() {
           <h1 className="page-title">Banking</h1>
           <p className="page-description">Accounts and transactions for your organization.</p>
         </div>
-        <button
-          className="button button-primary"
-          onClick={handleConnectClick}
-          disabled={connecting}
-        >
-          <WalletCards size={15} />
-          {connecting ? "Connecting…" : "Connect bank account"}
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            className="button"
+            onClick={handleRefresh}
+            disabled={refreshing}
+            title="Refresh balance and sync transactions"
+          >
+            <RefreshCw size={13} className={refreshing ? "animate-spin" : ""} />
+            {refreshing ? "Syncing…" : "Refresh"}
+          </button>
+          <button
+            className="button button-primary"
+            onClick={handleConnectClick}
+            disabled={connecting}
+          >
+            <WalletCards size={15} />
+            {connecting ? "Connecting…" : "Connect bank account"}
+          </button>
+        </div>
       </header>
 
       {/* Bank Selection Modal */}
@@ -416,7 +429,18 @@ export default function Banking() {
         </div>
       )}
 
-      <div className="section-heading">Accounts</div>
+      <div className="section-heading">
+        Accounts{" "}
+        <button
+          className="button"
+          onClick={handleRefresh}
+          disabled={refreshing}
+          title="Refresh balance and sync accounts"
+        >
+          <RefreshCw size={13} className={refreshing ? "animate-spin" : ""} />
+          {refreshing ? "Syncing…" : "Refresh"}
+        </button>
+      </div>
       {!Array.isArray(accounts) || accounts.length === 0 ? (
         <div className="notice">
           No accounts connected. Connect a bank account when a banking provider is configured.
@@ -444,7 +468,7 @@ export default function Banking() {
                       ? new Date(a.last_synced_at).toLocaleString()
                       : "Recently connected"}
                   </td>
-                  <td className="mono" style={{ textAlign: "right" }}>
+                  <td className="mono" style={{ textAlign: "right", fontWeight: 600 }}>
                     {a.currency}{" "}
                     {Number(a.balance).toLocaleString("en-DK", {
                       minimumFractionDigits: 2,
@@ -459,7 +483,12 @@ export default function Banking() {
 
       <div className="section-heading" style={{ marginTop: 34 }}>
         Recent transactions{" "}
-        <button className="button" onClick={handleRefresh} disabled={refreshing}>
+        <button
+          className="button"
+          onClick={handleRefresh}
+          disabled={refreshing}
+          title="Refresh transactions and balance"
+        >
           <RefreshCw size={13} className={refreshing ? "animate-spin" : ""} />
           {refreshing ? "Syncing…" : "Refresh"}
         </button>
