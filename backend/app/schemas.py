@@ -120,7 +120,95 @@ SupplierOut=CustomerOut
 class InvoiceLineIn(BaseModel): description: str=Field(min_length=1,max_length=500); quantity: Decimal=Field(gt=0); unit_price: Decimal=Field(ge=0); tax_rate: Decimal=Field(ge=0,le=100)
 class InvoiceIn(BaseModel): invoice_number: str; invoice_type: InvoiceType=InvoiceType.outgoing; customer_id: UUID|None=None; supplier_id: UUID|None=None; issue_date: date; due_date: date; currency: str="DKK"; notes: str|None=None; lines: list[InvoiceLineIn]=Field(min_length=1)
 class InvoiceLineOut(ORMModel): id: UUID; description: str; quantity: Decimal; unit_price: Decimal; tax_rate: Decimal; line_total: Decimal
-class InvoiceOut(ORMModel): id: UUID; invoice_number: str; invoice_type: InvoiceType; status: InvoiceStatus; customer_id: UUID|None; supplier_id: UUID|None; issue_date: date; due_date: date; currency: str; subtotal: Decimal; tax_amount: Decimal; total: Decimal; notes: str|None; created_at: datetime
+class InvoiceOut(ORMModel):
+    id: UUID
+    invoice_number: str
+    invoice_type: InvoiceType
+    status: InvoiceStatus
+    customer_id: UUID | None
+    supplier_id: UUID | None
+    issue_date: date
+    due_date: date
+    currency: str
+    subtotal: Decimal
+    tax_amount: Decimal
+    total: Decimal
+    paid_amount: Decimal = Decimal("0.00")
+    due_amount: Decimal = Decimal("0.00")
+    notes: str | None
+    created_at: datetime
+
+class ManualPaymentIn(BaseModel):
+    amount: Decimal | None = None
+    payment_date: date | None = None
+    payment_method: str = "manual"
+    reference: str | None = None
+    notes: str | None = None
+
+class InvoicePaymentOut(ORMModel):
+    id: UUID
+    invoice_id: UUID
+    amount: Decimal
+    payment_date: date
+    payment_method: str
+    reference: str | None
+    notes: str | None
+    created_at: datetime
+
+class LinkTransactionIn(BaseModel):
+    transaction_id: UUID
+    amount: Decimal | None = None
+
+class LinkInvoiceIn(BaseModel):
+    invoice_id: UUID
+    amount: Decimal | None = None
+
+class InvoiceMatchOut(ORMModel):
+    id: UUID
+    invoice_id: UUID
+    transaction_id: UUID
+    amount: Decimal
+    confidence: Decimal
+    confirmed: bool
+    created_at: datetime
+    transaction_booked_at: datetime | None = None
+    transaction_description: str | None = None
+    transaction_counterparty: str | None = None
+    transaction_amount: Decimal | None = None
+    transaction_currency: str | None = None
+    transaction_reference: str | None = None
+
+class MatchedInvoiceSummary(BaseModel):
+    match_id: UUID
+    invoice_id: UUID
+    invoice_number: str
+    amount: Decimal
+    invoice_total: Decimal
+    invoice_status: str
+
+class BankTransactionDetailOut(BaseModel):
+    id: str
+    booked_at: str
+    description: str
+    counterparty: str
+    amount: str
+    currency: str
+    reference: str | None
+    matched_amount: str = "0.00"
+    unmatched_amount: str = "0.00"
+    matches: list[MatchedInvoiceSummary] = []
+
+class LinkableTransactionOut(BaseModel):
+    id: UUID
+    booked_at: datetime
+    description: str
+    counterparty: str | None
+    amount: Decimal
+    currency: str
+    reference: str | None
+    matched_amount: Decimal
+    available_amount: Decimal
+
 class BankAuthorizeIn(BaseModel):
     aspsp_name: str | None = None
     aspsp_country: str | None = None

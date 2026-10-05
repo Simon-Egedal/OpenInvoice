@@ -1,12 +1,27 @@
+from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 from uuid import UUID
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import hash_password
 from app.core.runtime_config import settings_are_applied
-from app.models.entities import AuditLog, Invoice, InvoiceLine, MemberRole, Organization, OrganizationMember, User
+from app.models.entities import (
+    AuditLog,
+    BankAccount,
+    BankTransaction,
+    Invoice,
+    InvoiceLine,
+    InvoicePayment,
+    InvoiceStatus,
+    InvoiceTransactionMatch,
+    InvoiceType,
+    MemberRole,
+    Organization,
+    OrganizationMember,
+    User,
+)
 from app.providers.storage import storage_provider
 
 CENT=Decimal("0.01")
@@ -198,6 +213,284 @@ def prepare_infrastructure_update(
         "local_storage_path": runtime_settings.local_storage_path,
     }
     return values, url
+
+
+async def recalculate_invoice_payment(db: AsyncSession, invoice_id: UUID) -> Invoice:
+    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id))
+    if not invoice:
+        raise ValueError("Invoice not found")
+
+    manual_sum_val = await db.scalar(
+        select(func.coalesce(func.sum(InvoicePayment.amount), 0)).where(InvoicePayment.invoice_id == invoice_id)
+    )
+    manual_sum = Decimal(str(manual_sum_val or 0))
+
+    matched_sum_val = await db.scalar(
+        select(func.coalesce(func.sum(InvoiceTransactionMatch.amount), 0)).where(
+            InvoiceTransactionMatch.invoice_id == invoice_id,
+            InvoiceTransactionMatch.confirmed == True,
+        )
+    )
+    matched_sum = Decimal(str(matched_sum_val or 0))
+
+    total_paid = money(manual_sum + matched_sum)
+    invoice.paid_amount = total_paid
+
+    if total_paid >= invoice.total and invoice.total > Decimal("0.00"):
+        invoice.status = InvoiceStatus.paid
+    elif total_paid > Decimal("0.00"):
+        invoice.status = InvoiceStatus.partially_paid
+    elif total_paid == Decimal("0.00"):
+        if invoice.status in (InvoiceStatus.paid, InvoiceStatus.partially_paid):
+            invoice.status = InvoiceStatus.sent if invoice.invoice_type == InvoiceType.outgoing else InvoiceStatus.received
+
+    await db.flush()
+    return invoice
+
+
+async def record_manual_payment(
+    db: AsyncSession,
+    organization_id: UUID,
+    user_id: UUID,
+    invoice_id: UUID,
+    amount: Decimal | None = None,
+    payment_date: date | None = None,
+    payment_method: str = "manual",
+    reference: str | None = None,
+    notes: str | None = None,
+) -> InvoicePayment:
+    invoice = await db.scalar(
+        select(Invoice).where(Invoice.id == invoice_id, Invoice.organization_id == organization_id)
+    )
+    if not invoice:
+        raise ValueError("Invoice not found")
+
+    remaining_due = invoice.due_amount
+    if amount is None:
+        amount_to_pay = remaining_due
+    else:
+        amount_to_pay = money(Decimal(str(amount)))
+
+    if amount_to_pay <= Decimal("0.00"):
+        raise ValueError("Payment amount must be greater than zero")
+
+    effective_date = payment_date or datetime.now(timezone.utc).date()
+
+    payment = InvoicePayment(
+        organization_id=organization_id,
+        invoice_id=invoice_id,
+        amount=amount_to_pay,
+        payment_date=effective_date,
+        payment_method=payment_method.strip() or "manual",
+        reference=reference.strip() if reference else None,
+        notes=notes.strip() if notes else None,
+    )
+    db.add(payment)
+    await db.flush()
+
+    await recalculate_invoice_payment(db, invoice.id)
+
+    db.add(
+        AuditLog(
+            organization_id=organization_id,
+            user_id=user_id,
+            action="invoice.payment_recorded",
+            entity_type="invoice_payment",
+            entity_id=payment.id,
+            new_values={
+                "invoice_id": str(invoice.id),
+                "invoice_number": invoice.invoice_number,
+                "amount": str(payment.amount),
+                "payment_method": payment.payment_method,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(payment)
+    return payment
+
+
+async def delete_manual_payment(
+    db: AsyncSession,
+    organization_id: UUID,
+    user_id: UUID,
+    payment_id: UUID,
+) -> Invoice:
+    payment = await db.scalar(
+        select(InvoicePayment).where(
+            InvoicePayment.id == payment_id,
+            InvoicePayment.organization_id == organization_id,
+        )
+    )
+    if not payment:
+        raise ValueError("Payment not found")
+
+    invoice_id = payment.invoice_id
+    deleted_amount = str(payment.amount)
+    await db.delete(payment)
+    await db.flush()
+
+    invoice = await recalculate_invoice_payment(db, invoice_id)
+
+    db.add(
+        AuditLog(
+            organization_id=organization_id,
+            user_id=user_id,
+            action="invoice.payment_deleted",
+            entity_type="invoice_payment",
+            entity_id=payment_id,
+            new_values={"invoice_id": str(invoice_id), "amount": deleted_amount},
+        )
+    )
+    await db.commit()
+    await db.refresh(invoice)
+    return invoice
+
+
+async def link_invoice_to_transaction(
+    db: AsyncSession,
+    organization_id: UUID,
+    user_id: UUID,
+    invoice_id: UUID,
+    transaction_id: UUID,
+    amount: Decimal | None = None,
+) -> InvoiceTransactionMatch:
+    invoice = await db.scalar(
+        select(Invoice).where(Invoice.id == invoice_id, Invoice.organization_id == organization_id)
+    )
+    if not invoice:
+        raise ValueError("Invoice not found")
+
+    transaction = await db.scalar(
+        select(BankTransaction).where(
+            BankTransaction.id == transaction_id,
+            BankTransaction.organization_id == organization_id,
+        )
+    )
+    if not transaction:
+        raise ValueError("Bank transaction not found")
+
+    tx_magnitude = abs(Decimal(str(transaction.amount)))
+
+    existing_match = await db.scalar(
+        select(InvoiceTransactionMatch).where(
+            InvoiceTransactionMatch.invoice_id == invoice_id,
+            InvoiceTransactionMatch.transaction_id == transaction_id,
+            InvoiceTransactionMatch.organization_id == organization_id,
+        )
+    )
+
+    other_matched_val = await db.scalar(
+        select(func.coalesce(func.sum(InvoiceTransactionMatch.amount), 0)).where(
+            InvoiceTransactionMatch.transaction_id == transaction_id,
+            InvoiceTransactionMatch.invoice_id != invoice_id,
+            InvoiceTransactionMatch.confirmed == True,
+        )
+    )
+    other_matched = Decimal(str(other_matched_val or 0))
+    available_on_tx = max(Decimal("0.00"), tx_magnitude - other_matched)
+
+    if available_on_tx <= Decimal("0.00"):
+        raise ValueError("This bank transaction is already fully allocated to other invoices")
+
+    current_match_amount = existing_match.amount if existing_match else Decimal("0.00")
+    effective_due = invoice.due_amount + current_match_amount
+
+    if amount is None:
+        allocated = min(available_on_tx, effective_due)
+    else:
+        allocated = money(Decimal(str(amount)))
+        if allocated <= Decimal("0.00"):
+            raise ValueError("Allocated amount must be greater than zero")
+        if allocated > available_on_tx:
+            raise ValueError(
+                f"Specified amount ({allocated}) exceeds available unallocated transaction amount ({available_on_tx})"
+            )
+
+    if allocated <= Decimal("0.00"):
+        raise ValueError("No remaining balance on the invoice to link")
+
+    if existing_match:
+        existing_match.amount = allocated
+        existing_match.confirmed = True
+        existing_match.confidence = Decimal("1.00")
+        match_obj = existing_match
+    else:
+        match_obj = InvoiceTransactionMatch(
+            organization_id=organization_id,
+            invoice_id=invoice_id,
+            transaction_id=transaction_id,
+            amount=allocated,
+            confidence=Decimal("1.00"),
+            confirmed=True,
+        )
+        db.add(match_obj)
+
+    await db.flush()
+    await recalculate_invoice_payment(db, invoice.id)
+
+    db.add(
+        AuditLog(
+            organization_id=organization_id,
+            user_id=user_id,
+            action="invoice.transaction_linked",
+            entity_type="invoice_transaction_match",
+            entity_id=match_obj.id,
+            new_values={
+                "invoice_id": str(invoice.id),
+                "invoice_number": invoice.invoice_number,
+                "transaction_id": str(transaction.id),
+                "amount": str(match_obj.amount),
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(match_obj)
+    return match_obj
+
+
+async def unlink_invoice_transaction(
+    db: AsyncSession,
+    organization_id: UUID,
+    user_id: UUID,
+    match_id: UUID,
+) -> Invoice:
+    match_obj = await db.scalar(
+        select(InvoiceTransactionMatch).where(
+            InvoiceTransactionMatch.id == match_id,
+            InvoiceTransactionMatch.organization_id == organization_id,
+        )
+    )
+    if not match_obj:
+        raise ValueError("Transaction match not found")
+
+    invoice_id = match_obj.invoice_id
+    tx_id = match_obj.transaction_id
+    unlinked_amount = str(match_obj.amount)
+
+    await db.delete(match_obj)
+    await db.flush()
+
+    invoice = await recalculate_invoice_payment(db, invoice_id)
+
+    db.add(
+        AuditLog(
+            organization_id=organization_id,
+            user_id=user_id,
+            action="invoice.transaction_unlinked",
+            entity_type="invoice_transaction_match",
+            entity_id=match_id,
+            new_values={
+                "invoice_id": str(invoice_id),
+                "transaction_id": str(tx_id),
+                "amount": unlinked_amount,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(invoice)
+    return invoice
+
 
 
 

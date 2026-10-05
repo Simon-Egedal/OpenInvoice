@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Resp
 from fastapi.responses import StreamingResponse
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,12 +16,69 @@ from app.auth import admin_membership, current_membership, current_user, hash_pa
 from app.core.config import settings
 from app.core.runtime_config import config_path, read_saved_settings, save_settings, settings_are_applied
 from app.db.session import get_db
-from app.models.entities import AuditLog, BankAccount, BankConnection, BankTransaction, Customer, EmailDelivery, Invoice, InvoiceDocument, InvoiceLine, InvoiceStatus, InvoiceType, Organization, OrganizationMember, Supplier, User
+from app.models.entities import (
+    AuditLog,
+    BankAccount,
+    BankConnection,
+    BankTransaction,
+    Customer,
+    EmailDelivery,
+    Invoice,
+    InvoiceDocument,
+    InvoiceLine,
+    InvoicePayment,
+    InvoiceStatus,
+    InvoiceTransactionMatch,
+    InvoiceType,
+    Organization,
+    OrganizationMember,
+    Supplier,
+    User,
+)
 from app.providers.banking import EnableBankingProvider, MockBankingProvider
 from app.providers.email import email_provider
 from app.providers.storage import storage_provider
-from app.schemas import BankAuthorizeIn, BankCallbackIn, CustomerIn, CustomerOut, InfrastructureSettingsIn, InfrastructureSettingsOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, OrganizationUpdateIn, RegisterIn, SetupAdminIn, SetupIn, SetupOrgOut, SupplierIn, SupplierOut, UserOut
-from app.services import create_initial_admin, create_initial_organization, create_invoice, get_infrastructure_config, money, prepare_infrastructure_update
+from app.schemas import (
+    BankAuthorizeIn,
+    BankCallbackIn,
+    BankTransactionDetailOut,
+    CustomerIn,
+    CustomerOut,
+    InfrastructureSettingsIn,
+    InfrastructureSettingsOut,
+    InvoiceIn,
+    InvoiceLineOut,
+    InvoiceMatchOut,
+    InvoiceOut,
+    InvoicePaymentOut,
+    LinkableTransactionOut,
+    LinkInvoiceIn,
+    LinkTransactionIn,
+    LoginIn,
+    ManualPaymentIn,
+    MatchedInvoiceSummary,
+    OrganizationOut,
+    OrganizationUpdateIn,
+    RegisterIn,
+    SetupAdminIn,
+    SetupIn,
+    SetupOrgOut,
+    SupplierIn,
+    SupplierOut,
+    UserOut,
+)
+from app.services import (
+    create_initial_admin,
+    create_initial_organization,
+    create_invoice,
+    delete_manual_payment,
+    get_infrastructure_config,
+    link_invoice_to_transaction,
+    money,
+    prepare_infrastructure_update,
+    record_manual_payment,
+    unlink_invoice_transaction,
+)
 
 router=APIRouter()
 setup_lock=asyncio.Lock()
@@ -533,7 +590,184 @@ async def send_invoice(invoice_id:UUID,user=Depends(current_user),m=Depends(curr
         await db.commit(); raise HTTPException(502,"Email delivery failed") from exc
     await db.commit(); return {"status":delivery.status,"recipient":delivery.recipient}
 
-@router.get("/banking/accounts")
+@router.post("/invoices/{invoice_id}/payments", response_model=InvoicePaymentOut, status_code=201)
+async def add_invoice_payment(
+    invoice_id: UUID,
+    payload: ManualPaymentIn | None = None,
+    user = Depends(current_user),
+    m = Depends(write_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    data = payload or ManualPaymentIn()
+    try:
+        return await record_manual_payment(
+            db=db,
+            organization_id=m.organization_id,
+            user_id=user.id,
+            invoice_id=invoice_id,
+            amount=data.amount,
+            payment_date=data.payment_date,
+            payment_method=data.payment_method,
+            reference=data.reference,
+            notes=data.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+@router.get("/invoices/{invoice_id}/payments", response_model=list[InvoicePaymentOut])
+async def list_invoice_payments(
+    invoice_id: UUID,
+    m = Depends(current_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    inv = await db.scalar(select(Invoice.id).where(Invoice.id == invoice_id, Invoice.organization_id == m.organization_id))
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    result = await db.execute(
+        select(InvoicePayment)
+        .where(InvoicePayment.invoice_id == invoice_id, InvoicePayment.organization_id == m.organization_id)
+        .order_by(InvoicePayment.payment_date.desc(), InvoicePayment.created_at.desc())
+    )
+    return result.scalars().all()
+
+@router.delete("/invoices/{invoice_id}/payments/{payment_id}", response_model=InvoiceOut)
+async def remove_invoice_payment(
+    invoice_id: UUID,
+    payment_id: UUID,
+    user = Depends(current_user),
+    m = Depends(write_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await delete_manual_payment(db, m.organization_id, user.id, payment_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+@router.post("/invoices/{invoice_id}/link-transaction", response_model=InvoiceMatchOut, status_code=201)
+async def link_transaction_route(
+    invoice_id: UUID,
+    payload: LinkTransactionIn,
+    user = Depends(current_user),
+    m = Depends(write_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        match_obj = await link_invoice_to_transaction(
+            db=db,
+            organization_id=m.organization_id,
+            user_id=user.id,
+            invoice_id=invoice_id,
+            transaction_id=payload.transaction_id,
+            amount=payload.amount,
+        )
+        tx = await db.scalar(select(BankTransaction).where(BankTransaction.id == payload.transaction_id))
+        return InvoiceMatchOut(
+            id=match_obj.id,
+            invoice_id=match_obj.invoice_id,
+            transaction_id=match_obj.transaction_id,
+            amount=match_obj.amount,
+            confidence=match_obj.confidence,
+            confirmed=match_obj.confirmed,
+            created_at=match_obj.created_at,
+            transaction_booked_at=tx.booked_at if tx else None,
+            transaction_description=tx.description if tx else None,
+            transaction_counterparty=tx.counterparty if tx else None,
+            transaction_amount=tx.amount if tx else None,
+            transaction_currency=tx.currency if tx else None,
+            transaction_reference=tx.reference if tx else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+@router.get("/invoices/{invoice_id}/matches", response_model=list[InvoiceMatchOut])
+async def list_invoice_matches(
+    invoice_id: UUID,
+    m = Depends(current_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    inv = await db.scalar(select(Invoice.id).where(Invoice.id == invoice_id, Invoice.organization_id == m.organization_id))
+    if not inv:
+        raise HTTPException(404, "Invoice not found")
+    result = await db.execute(
+        select(InvoiceTransactionMatch, BankTransaction)
+        .join(BankTransaction, InvoiceTransactionMatch.transaction_id == BankTransaction.id)
+        .where(
+            InvoiceTransactionMatch.invoice_id == invoice_id,
+            InvoiceTransactionMatch.organization_id == m.organization_id,
+        )
+        .order_by(InvoiceTransactionMatch.created_at.desc())
+    )
+    rows = result.all()
+    return [
+        InvoiceMatchOut(
+            id=match_obj.id,
+            invoice_id=match_obj.invoice_id,
+            transaction_id=match_obj.transaction_id,
+            amount=match_obj.amount,
+            confidence=match_obj.confidence,
+            confirmed=match_obj.confirmed,
+            created_at=match_obj.created_at,
+            transaction_booked_at=tx.booked_at,
+            transaction_description=tx.description,
+            transaction_counterparty=tx.counterparty,
+            transaction_amount=tx.amount,
+            transaction_currency=tx.currency,
+            transaction_reference=tx.reference,
+        )
+        for match_obj, tx in rows
+    ]
+
+@router.delete("/invoices/{invoice_id}/matches/{match_id}", response_model=InvoiceOut)
+async def unlink_transaction_route(
+    invoice_id: UUID,
+    match_id: UUID,
+    user = Depends(current_user),
+    m = Depends(write_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await unlink_invoice_transaction(db, m.organization_id, user.id, match_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+@router.get("/invoices/{invoice_id}/linkable-transactions", response_model=list[LinkableTransactionOut])
+async def linkable_transactions_route(
+    invoice_id: UUID,
+    m = Depends(current_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    tx_result = await db.execute(
+        select(BankTransaction)
+        .where(BankTransaction.organization_id == m.organization_id)
+        .order_by(BankTransaction.booked_at.desc())
+        .limit(100)
+    )
+    transactions = tx_result.scalars().all()
+    items = []
+    for tx in transactions:
+        tx_mag = abs(Decimal(str(tx.amount)))
+        matched_val = await db.scalar(
+            select(func.coalesce(func.sum(InvoiceTransactionMatch.amount), 0)).where(
+                InvoiceTransactionMatch.transaction_id == tx.id,
+                InvoiceTransactionMatch.invoice_id != invoice_id,
+                InvoiceTransactionMatch.confirmed == True,
+            )
+        )
+        matched = Decimal(str(matched_val or 0))
+        available = max(Decimal("0.00"), tx_mag - matched)
+        items.append(LinkableTransactionOut(
+            id=tx.id,
+            booked_at=tx.booked_at,
+            description=tx.description,
+            counterparty=tx.counterparty,
+            amount=tx.amount,
+            currency=tx.currency,
+            reference=tx.reference,
+            matched_amount=matched,
+            available_amount=available,
+        ))
+    return items
+
 @router.get("/banking/aspsps")
 async def get_banking_aspsps(
     country: str | None = None,
@@ -588,8 +822,34 @@ async def bank_transactions(m: OrganizationMember = Depends(current_membership),
     )
     saved = result.scalars().all()
     if saved:
-        return [
-            {
+        saved_ids = [t.id for t in saved]
+        matches_by_tx = {}
+        if saved_ids:
+            matches_result = await db.execute(
+                select(InvoiceTransactionMatch, Invoice)
+                .join(Invoice, InvoiceTransactionMatch.invoice_id == Invoice.id)
+                .where(
+                    InvoiceTransactionMatch.transaction_id.in_(saved_ids),
+                    InvoiceTransactionMatch.organization_id == m.organization_id,
+                    InvoiceTransactionMatch.confirmed == True,
+                )
+            )
+            for m_obj, inv in matches_result.all():
+                matches_by_tx.setdefault(m_obj.transaction_id, []).append({
+                    "match_id": str(m_obj.id),
+                    "invoice_id": str(inv.id),
+                    "invoice_number": inv.invoice_number,
+                    "amount": str(m_obj.amount),
+                    "invoice_total": str(inv.total),
+                    "invoice_status": inv.status.value,
+                })
+
+        items = []
+        for t in saved:
+            matches = matches_by_tx.get(t.id, [])
+            matched_sum = sum(Decimal(m["amount"]) for m in matches)
+            unmatched = max(Decimal("0.00"), abs(t.amount) - matched_sum)
+            items.append({
                 "id": str(t.id),
                 "booked_at": t.booked_at.isoformat(),
                 "description": t.description,
@@ -597,12 +857,72 @@ async def bank_transactions(m: OrganizationMember = Depends(current_membership),
                 "amount": str(t.amount),
                 "currency": t.currency,
                 "reference": t.reference,
-            }
-            for t in saved
-        ]
+                "matched_amount": str(matched_sum),
+                "unmatched_amount": str(unmatched),
+                "matches": matches,
+            })
+        return items
+
     if settings.banking_provider == "enable_banking":
         return []
-    return await MockBankingProvider().get_transactions("mock-account-1")
+    mock_txs = await MockBankingProvider().get_transactions("mock-account-1")
+    return [
+        {
+            **tx,
+            "matched_amount": "0.00",
+            "unmatched_amount": str(abs(Decimal(str(tx["amount"])))),
+            "matches": [],
+        }
+        for tx in mock_txs
+    ]
+
+@router.post("/banking/transactions/{transaction_id}/link-invoice", response_model=InvoiceMatchOut, status_code=201)
+async def banking_link_invoice(
+    transaction_id: UUID,
+    payload: LinkInvoiceIn,
+    user = Depends(current_user),
+    m = Depends(write_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        match_obj = await link_invoice_to_transaction(
+            db=db,
+            organization_id=m.organization_id,
+            user_id=user.id,
+            invoice_id=payload.invoice_id,
+            transaction_id=transaction_id,
+            amount=payload.amount,
+        )
+        tx = await db.scalar(select(BankTransaction).where(BankTransaction.id == transaction_id))
+        return InvoiceMatchOut(
+            id=match_obj.id,
+            invoice_id=match_obj.invoice_id,
+            transaction_id=match_obj.transaction_id,
+            amount=match_obj.amount,
+            confidence=match_obj.confidence,
+            confirmed=match_obj.confirmed,
+            created_at=match_obj.created_at,
+            transaction_booked_at=tx.booked_at if tx else None,
+            transaction_description=tx.description if tx else None,
+            transaction_counterparty=tx.counterparty if tx else None,
+            transaction_amount=tx.amount if tx else None,
+            transaction_currency=tx.currency if tx else None,
+            transaction_reference=tx.reference if tx else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+@router.delete("/banking/matches/{match_id}", response_model=InvoiceOut)
+async def banking_unlink_match(
+    match_id: UUID,
+    user = Depends(current_user),
+    m = Depends(write_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await unlink_invoice_transaction(db, m.organization_id, user.id, match_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 @router.post("/banking/connections/authorize")
 async def bank_authorize(

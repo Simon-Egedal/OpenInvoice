@@ -50,3 +50,11 @@ def test_enable_banking_jwt_and_response_parsing(tmp_path):
     assert payload["aud"] == "api.enablebanking.com"
     assert payload["exp"] > payload["iat"]
 
+def test_banking_routes_mapping():
+    from app.api.v1.router import router
+    route_endpoints = {r.path: r.endpoint.__name__ for r in router.routes if "GET" in r.methods}
+    assert route_endpoints.get("/banking/accounts") == "bank_accounts"
+    assert route_endpoints.get("/banking/aspsps") == "get_banking_aspsps"
+    assert route_endpoints.get("/banking/transactions") == "bank_transactions"
+
+

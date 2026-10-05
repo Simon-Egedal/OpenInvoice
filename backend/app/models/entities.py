@@ -72,7 +72,12 @@ class Invoice(IdMixin, TimestampMixin, Base):
     subtotal: Mapped[Decimal]=mapped_column(Numeric(14,2), default=Decimal("0"))
     tax_amount: Mapped[Decimal]=mapped_column(Numeric(14,2), default=Decimal("0"))
     total: Mapped[Decimal]=mapped_column(Numeric(14,2), default=Decimal("0"))
+    paid_amount: Mapped[Decimal]=mapped_column(Numeric(14,2), default=Decimal("0"))
     notes: Mapped[str|None]=mapped_column(Text, nullable=True)
+
+    @property
+    def due_amount(self) -> Decimal:
+        return max(Decimal("0.00"), self.total - (self.paid_amount or Decimal("0.00")))
 
 class InvoiceLine(IdMixin, Base):
     __tablename__="invoice_lines"
@@ -124,10 +129,21 @@ class BankTransaction(IdMixin, TimestampMixin, Base):
 class InvoiceTransactionMatch(IdMixin, TimestampMixin, Base):
     __tablename__="invoice_transaction_matches"
     organization_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
-    invoice_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("invoices.id", ondelete="CASCADE"))
-    transaction_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("bank_transactions.id", ondelete="CASCADE"))
-    confidence: Mapped[Decimal]=mapped_column(Numeric(5,2))
+    invoice_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("invoices.id", ondelete="CASCADE"), index=True)
+    transaction_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("bank_transactions.id", ondelete="CASCADE"), index=True)
+    amount: Mapped[Decimal]=mapped_column(Numeric(14,2), default=Decimal("0"))
+    confidence: Mapped[Decimal]=mapped_column(Numeric(5,2), default=Decimal("1.00"))
     confirmed: Mapped[bool]=mapped_column(Boolean, default=False)
+
+class InvoicePayment(IdMixin, TimestampMixin, Base):
+    __tablename__="invoice_payments"
+    organization_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    invoice_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("invoices.id", ondelete="CASCADE"), index=True)
+    amount: Mapped[Decimal]=mapped_column(Numeric(14,2), default=Decimal("0"))
+    payment_date: Mapped[datetime.date]=mapped_column(Date)
+    payment_method: Mapped[str]=mapped_column(String(50), default="manual")
+    reference: Mapped[str|None]=mapped_column(String(200), nullable=True)
+    notes: Mapped[str|None]=mapped_column(Text, nullable=True)
 class EmailDelivery(IdMixin, TimestampMixin, Base):
     __tablename__="email_deliveries"
     organization_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
