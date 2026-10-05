@@ -1,13 +1,20 @@
 "use client";
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api } from "@/lib/api";
+import { api, SetupStatus } from "@/lib/api";
 
 export default function AuthPage() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [organizationName, setOrganizationName] = useState("");
   const router = useRouter();
+
+  useEffect(() => {
+    api<SetupStatus>("/setup/status")
+      .then((status) => setOrganizationName(status.organization_name || ""))
+      .catch(() => {});
+  }, []);
 
   async function submit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -35,7 +42,7 @@ export default function AuthPage() {
       </Link>
       <h1 className="page-title">Welcome back</h1>
       <p className="page-description" style={{ marginBottom: 25 }}>
-        Sign in to your organization.
+        Sign in to {organizationName || "your organization"}.
       </p>
       <form onSubmit={submit} className="form-grid">
         <div className="field full">

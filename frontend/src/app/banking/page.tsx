@@ -134,7 +134,8 @@ export default function Banking() {
     setShowMatchModal(true);
     try {
       const allInvoices = await api<Invoice[]>("/invoices");
-      const unpaid = allInvoices.filter((inv) => Number(inv.due_amount ?? inv.total) > 0);
+      const expectedType = tx.direction === "credit" ? "outgoing" : "incoming";
+      const unpaid = allInvoices.filter((inv) => Number(inv.due_amount ?? inv.total) > 0 && inv.invoice_type === expectedType);
       setOpenInvoices(unpaid);
       if (unpaid.length > 0) {
         const first = unpaid[0];
@@ -501,6 +502,7 @@ export default function Banking() {
               <th>Description</th>
               <th>Counterparty</th>
               <th>Reference</th>
+              <th>Credit/Debit</th>
               <th style={{ textAlign: "right" }}>Amount</th>
               <th>Reconciliation / Match</th>
               <th style={{ textAlign: "right" }}>Action</th>
@@ -509,7 +511,7 @@ export default function Banking() {
           <tbody>
             {!Array.isArray(transactions) || transactions.length === 0 ? (
               <tr>
-                <td colSpan={7} style={{ textAlign: "center", color: "var(--muted)", padding: "24px" }}>
+                <td colSpan={8} style={{ textAlign: "center", color: "var(--muted)", padding: "24px" }}>
                   No transactions yet. Connect a bank account to see transactions.
                 </td>
               </tr>
@@ -525,6 +527,7 @@ export default function Banking() {
                     <td className="td-strong">{t.description}</td>
                     <td>{t.counterparty || "—"}</td>
                     <td className="mono">{t.reference ?? "—"}</td>
+                    <td><span className={`status ${t.direction === "credit" ? "paid" : "partially_paid"}`}>{t.direction === "credit" ? "Credit" : "Debit"}</span></td>
                     <td
                       className="mono"
                       style={{

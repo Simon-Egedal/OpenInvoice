@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Plus, Trash2 } from "lucide-react";
-import { api, Organization, Party } from "@/lib/api";
+import { api, Organization, Party, Product } from "@/lib/api";
 
 type Line = {
   description: string;
@@ -16,6 +16,7 @@ type Line = {
 export default function NewInvoice() {
   const router = useRouter();
   const [customers, setCustomers] = useState<Party[]>([]);
+  const [products, setProducts] = useState<Product[]>([]);
   const [currency, setCurrency] = useState("DKK");
   const [lines, setLines] = useState<Line[]>([
     { description: "", quantity: "1", unit_price: "0.00", tax_rate: "25" },
@@ -26,6 +27,7 @@ export default function NewInvoice() {
 
   useEffect(() => {
     api<Party[]>("/customers").then(setCustomers).catch(() => {});
+    api<Product[]>("/products").then(setProducts).catch(() => {});
     api<Organization[]>("/organizations")
       .then((orgs) => {
         if (orgs && orgs.length > 0 && orgs[0].currency) {
@@ -147,20 +149,23 @@ export default function NewInvoice() {
           </Field>
         </div>
         <div className="section-heading" style={{ marginBottom: 10 }}>
-          Invoice lines{" "}
-          <button
-            type="button"
-            className="button"
-            onClick={() =>
-              setLines([
-                ...lines,
-                { description: "", quantity: "1", unit_price: "0.00", tax_rate: "25" },
-              ])
-            }
-          >
-            <Plus size={14} />
-            Add line
-          </button>
+          <span>Invoice lines</span>
+          <div style={{ display: "flex", gap: 8 }}>
+            <Link href="/products" className="button">Manage products</Link>
+            <button
+              type="button"
+              className="button"
+              onClick={() =>
+                setLines([
+                  ...lines,
+                  { description: "", quantity: "1", unit_price: "0.00", tax_rate: "25" },
+                ])
+              }
+            >
+              <Plus size={14} />
+              Add line
+            </button>
+          </div>
         </div>
         <div className="table-wrap">
           <table>
@@ -178,14 +183,38 @@ export default function NewInvoice() {
               {lines.map((l, i) => (
                 <tr key={i}>
                   <td>
-                    <input
-                      required
-                      className="filter"
-                      style={{ width: "100%", minWidth: 140 }}
-                      aria-label="Description"
-                      value={l.description}
-                      onChange={(e) => update(i, "description", e.target.value)}
-                    />
+                    <div style={{ display: "grid", gap: 5, minWidth: 140 }}>
+                      {products.length > 0 && (
+                        <select
+                          className="filter"
+                          aria-label="Choose saved product"
+                          defaultValue=""
+                          onChange={(e) => {
+                            const product = products.find((item) => item.id === e.target.value);
+                            if (product) {
+                              update(i, "description", product.name);
+                              update(i, "unit_price", product.unit_price);
+                            }
+                            e.target.value = "";
+                          }}
+                        >
+                          <option value="">Choose saved product…</option>
+                          {products.map((product) => (
+                            <option key={product.id} value={product.id}>
+                              {product.name} · {currency} {Number(product.unit_price).toFixed(2)}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      <input
+                        required
+                        className="filter"
+                        style={{ width: "100%" }}
+                        aria-label="Description"
+                        value={l.description}
+                        onChange={(e) => update(i, "description", e.target.value)}
+                      />
+                    </div>
                   </td>
                   <td>
                     <input

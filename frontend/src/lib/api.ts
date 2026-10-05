@@ -89,6 +89,7 @@ export type BankTransactionItem = {
   description: string;
   counterparty: string;
   amount: string;
+  direction: "credit" | "debit";
   currency: string;
   reference: string | null;
   matched_amount?: string;
@@ -97,6 +98,8 @@ export type BankTransactionItem = {
 };
 
 export type Party = { id:string; name:string; email:string|null; phone:string|null; address:string|null; postal_code:string|null; city:string|null; country:string; vat_number:string|null; payment_information:string|null; notes:string|null };
+export type Product = { id: string; name: string; unit_price: string };
+export type CurrentUser = { id: string; email: string; full_name: string };
 export type SetupStatus = {
   complete: boolean;
   applied: boolean;
@@ -142,4 +145,3 @@ export type InfrastructureConfig = {
   session_cookie_secure: boolean;
   restart_required: boolean;
 };
-

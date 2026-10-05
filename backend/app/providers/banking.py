@@ -408,6 +408,7 @@ class EnableBankingProvider(BankingProvider):
                 "description": str(desc)[:300],
                 "counterparty": str(counterparty or "")[:200],
                 "amount": amt,
+                "direction": "debit" if indicator == "DBIT" else "credit",
                 "currency": str(curr).upper()[:3],
                 "reference": str(t.get("entry_reference") or "")[:200] or None,
             })

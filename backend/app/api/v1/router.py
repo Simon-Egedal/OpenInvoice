@@ -34,6 +34,7 @@ from app.models.entities import (
     InvoiceType,
     Organization,
     OrganizationMember,
+    Product,
     Supplier,
     User,
 )
@@ -61,6 +62,8 @@ from app.schemas import (
     MatchedInvoiceSummary,
     OrganizationOut,
     OrganizationUpdateIn,
+    ProductIn,
+    ProductOut,
     RegisterIn,
     SetupAdminIn,
     SetupIn,
@@ -473,6 +476,31 @@ async def create_organization(payload: dict, user: User = Depends(current_user),
 
 async def entity_list(model, db, org_id):
     result=await db.execute(select(model).where(model.organization_id==org_id).order_by(model.name)); return result.scalars().all()
+@router.get("/products", response_model=list[ProductOut])
+async def products(m=Depends(current_membership), db:AsyncSession=Depends(get_db)):
+    result = await db.execute(select(Product).where(Product.organization_id == m.organization_id).order_by(Product.name))
+    return result.scalars().all()
+
+@router.post("/products", response_model=ProductOut, status_code=201)
+async def add_product(payload:ProductIn, user=Depends(current_user), m=Depends(write_membership), db:AsyncSession=Depends(get_db)):
+    item = Product(**payload.model_dump(), organization_id=m.organization_id)
+    db.add(item)
+    await db.flush()
+    db.add(AuditLog(organization_id=m.organization_id, user_id=user.id, action="product.created", entity_type="product", entity_id=item.id, new_values={"name":item.name, "unit_price":str(item.unit_price)}))
+    await db.commit()
+    await db.refresh(item)
+    return item
+
+@router.delete("/products/{item_id}", status_code=204)
+async def delete_product(item_id:UUID, user=Depends(current_user), m=Depends(write_membership), db:AsyncSession=Depends(get_db)):
+    item = await db.scalar(select(Product).where(Product.id == item_id, Product.organization_id == m.organization_id))
+    if not item:
+        raise HTTPException(404, "Product not found")
+    db.add(AuditLog(organization_id=m.organization_id, user_id=user.id, action="product.deleted", entity_type="product", entity_id=item.id, old_values={"name":item.name, "unit_price":str(item.unit_price)}))
+    await db.delete(item)
+    await db.commit()
+    return Response(status_code=204)
+
 @router.get("/customers",response_model=list[CustomerOut])
 async def customers(m=Depends(current_membership),db:AsyncSession=Depends(get_db)): return await entity_list(Customer,db,m.organization_id)
 @router.post("/customers",response_model=CustomerOut,status_code=201)
@@ -1101,6 +1129,7 @@ async def bank_transactions(m: OrganizationMember = Depends(current_membership),
                 "description": t.description,
                 "counterparty": t.counterparty or "",
                 "amount": str(t.amount),
+                "direction": t.direction,
                 "currency": t.currency,
                 "reference": t.reference,
                 "matched_amount": str(matched_sum),
@@ -1115,6 +1144,7 @@ async def bank_transactions(m: OrganizationMember = Depends(current_membership),
     return [
         {
             **tx,
+            "direction": tx.get("direction") or ("credit" if Decimal(str(tx["amount"])) >= 0 else "debit"),
             "matched_amount": "0.00",
             "unmatched_amount": str(abs(Decimal(str(tx["amount"])))),
             "matches": [],
@@ -1270,6 +1300,7 @@ async def bank_callback(
                     description=str(t["description"])[:300],
                     counterparty=str(t["counterparty"])[:200] if t.get("counterparty") else None,
                     amount=t["amount"],
+                    direction=t.get("direction") or ("credit" if Decimal(str(t["amount"])) >= 0 else "debit"),
                     currency=str(t["currency"])[:3].upper(),
                     reference=str(t["reference"])[:200] if t.get("reference") else None,
                 ))
@@ -1347,6 +1378,7 @@ async def bank_sync(m: OrganizationMember = Depends(current_membership), db: Asy
                 description=desc,
                 counterparty=cp,
                 amount=amt,
+                direction="credit" if amt >= 0 else "debit",
                 currency=curr,
                 reference=ref,
             ))
@@ -1405,6 +1437,7 @@ async def bank_sync(m: OrganizationMember = Depends(current_membership), db: Asy
                         description=str(t["description"])[:300],
                         counterparty=str(t["counterparty"])[:200] if t.get("counterparty") else None,
                         amount=amt,
+                        direction=t.get("direction") or ("credit" if amt >= 0 else "debit"),
                         currency=str(t["currency"])[:3].upper(),
                         reference=str(t["reference"])[:200] if t.get("reference") else None,
                     ))

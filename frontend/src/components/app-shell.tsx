@@ -2,8 +2,8 @@
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { API, api, Invoice, Organization, SetupStatus } from "@/lib/api";
-import { Activity, Building2, ChevronDown, FileText, LayoutDashboard, LogIn, Menu, Settings, Users, WalletCards, X } from "lucide-react";
+import { API, api, CurrentUser, Invoice, Organization, SetupStatus } from "@/lib/api";
+import { Activity, Building2, ChevronDown, FileText, LayoutDashboard, LogIn, LogOut, Menu, Package, Settings, Users, WalletCards, X } from "lucide-react";
 
 const links = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
@@ -11,6 +11,7 @@ const links = [
   { href: "/banking", label: "Banking", icon: WalletCards },
   { href: "/customers", label: "Customers", icon: Users },
   { href: "/suppliers", label: "Suppliers", icon: Building2 },
+  { href: "/products", label: "Products", icon: Package },
   { href: "/audit", label: "Activity", icon: Activity },
 ];
 
@@ -19,6 +20,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [currentOrg, setCurrentOrg] = useState<Organization | null>(null);
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [authError, setAuthError] = useState("");
   const [invoiceCount, setInvoiceCount] = useState<number | null>(null);
 
   useEffect(() => {
@@ -38,6 +43,36 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       })
       .catch(() => {});
   }, [path, router]);
+
+  useEffect(() => {
+    setAuthChecked(false);
+    api<CurrentUser>("/auth/me")
+      .then(setCurrentUser)
+      .catch(() => setCurrentUser(null))
+      .finally(() => setAuthChecked(true));
+  }, [path]);
+
+  useEffect(() => {
+    if (authChecked && !currentUser && path !== "/auth" && !path.startsWith("/setup")) {
+      router.replace("/auth");
+    }
+  }, [authChecked, currentUser, path, router]);
+
+  async function logout() {
+    setLoggingOut(true);
+    setAuthError("");
+    try {
+      await api<void>("/auth/logout", { method: "POST" });
+      setCurrentUser(null);
+      setAuthChecked(true);
+      setOpen(false);
+      router.push("/auth");
+    } catch (e) {
+      setAuthError(e instanceof Error ? e.message : "Unable to log out");
+    } finally {
+      setLoggingOut(false);
+    }
+  }
 
   useEffect(() => {
     if (path.startsWith("/setup") || path === "/auth") return;
@@ -67,6 +102,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   if (path === "/setup" || path.startsWith("/setup/")) {
     return <main className="setup-shell">{children}</main>;
+  }
+
+  if (!authChecked || !currentUser) {
+    return <main className="signed-out-area">{children}</main>;
   }
 
   return (
@@ -121,20 +160,37 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <Settings size={17} />
             Settings
           </Link>
-          <Link href="/auth" className={`nav-link ${path === "/auth" ? "active" : ""}`}>
-            <LogIn size={17} />
-            Sign in / switch account
-          </Link>
-          <div className="profile">
-            <span className="avatar">OI</span>
-            <span>
-              OpenInvoice
-              <small>Self-hosted workspace</small>
-            </span>
-          </div>
+          {authChecked && (
+            <Link href="/auth" className={`nav-link ${path === "/auth" ? "active" : ""}`}>
+              <LogIn size={17} />
+              {currentUser ? "Switch account" : "Sign in"}
+            </Link>
+          )}
+          {authChecked && currentUser && (
+            <button type="button" className="nav-link" onClick={logout} disabled={loggingOut}>
+              <LogOut size={17} />
+              {loggingOut ? "Logging out…" : "Log out"}
+            </button>
+          )}
+          {authError && <p className="error-text" role="alert" style={{ padding: "0 10px" }}>{authError}</p>}
+          {authChecked && currentUser && (
+            <div className="profile">
+              <span className="avatar">{getInitials(currentUser.full_name)}</span>
+              <span>
+                {currentUser.full_name}
+                <small>{currentUser.email}</small>
+              </span>
+            </div>
+          )}
         </div>
       </aside>
       <main className="main-area">{children}</main>
     </div>
   );
+}
+
+function getInitials(name: string) {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length > 1) return `${parts[0][0]}${parts[parts.length - 1][0]}`.toUpperCase();
+  return (parts[0] || "?").slice(0, 2).toUpperCase();
 }

@@ -57,6 +57,12 @@ class Party(IdMixin, TimestampMixin, Base):
 class Customer(Party): __tablename__="customers"
 class Supplier(Party): __tablename__="suppliers"
 
+class Product(IdMixin, TimestampMixin, Base):
+    __tablename__="products"
+    organization_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str]=mapped_column(String(200), index=True)
+    unit_price: Mapped[Decimal]=mapped_column(Numeric(14,2))
+
 class Invoice(IdMixin, TimestampMixin, Base):
     __tablename__="invoices"
     organization_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
@@ -124,6 +130,7 @@ class BankTransaction(IdMixin, TimestampMixin, Base):
     description: Mapped[str]=mapped_column(String(300))
     counterparty: Mapped[str|None]=mapped_column(String(200), nullable=True)
     amount: Mapped[Decimal]=mapped_column(Numeric(16,2))
+    direction: Mapped[str]=mapped_column(String(10), default="credit")
     currency: Mapped[str]=mapped_column(String(3), default="DKK")
     reference: Mapped[str|None]=mapped_column(String(200), nullable=True)
 class InvoiceTransactionMatch(IdMixin, TimestampMixin, Base):
@@ -164,4 +171,3 @@ class AuditLog(IdMixin, Base):
     old_values: Mapped[dict|None]=mapped_column(JSON, nullable=True)
     new_values: Mapped[dict|None]=mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
-

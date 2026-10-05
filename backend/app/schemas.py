@@ -117,6 +117,16 @@ class CustomerIn(BaseModel):
 class CustomerOut(ORMModel): id: UUID; name: str; email: str|None; phone: str|None; address: str|None; postal_code: str|None; city: str|None; country: str; vat_number: str|None; payment_information: str|None; notes: str|None
 SupplierIn=CustomerIn
 SupplierOut=CustomerOut
+class ProductIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    unit_price: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def clean_product_name(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+class ProductOut(ORMModel): id: UUID; name: str; unit_price: Decimal
 class InvoiceLineIn(BaseModel): description: str=Field(min_length=1,max_length=500); quantity: Decimal=Field(gt=0); unit_price: Decimal=Field(ge=0); tax_rate: Decimal=Field(ge=0,le=100)
 class InvoiceIn(BaseModel): invoice_number: str; invoice_type: InvoiceType=InvoiceType.outgoing; customer_id: UUID|None=None; supplier_id: UUID|None=None; issue_date: date; due_date: date; currency: str="DKK"; notes: str|None=None; lines: list[InvoiceLineIn]=Field(min_length=1)
 class InvoiceLineOut(ORMModel): id: UUID; description: str; quantity: Decimal; unit_price: Decimal; tax_rate: Decimal; line_total: Decimal

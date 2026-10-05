@@ -370,6 +370,12 @@ async def link_invoice_to_transaction(
     if not transaction:
         raise ValueError("Bank transaction not found")
 
+    expected_invoice_type = InvoiceType.outgoing if transaction.direction == "credit" else InvoiceType.incoming
+    if invoice.invoice_type != expected_invoice_type:
+        direction_label = "credit" if transaction.direction == "credit" else "debit"
+        invoice_label = "outgoing" if transaction.direction == "credit" else "incoming"
+        raise ValueError(f"A {direction_label} transaction can only be matched to an {invoice_label} invoice")
+
     tx_magnitude = abs(Decimal(str(transaction.amount)))
 
     existing_match = await db.scalar(
@@ -490,7 +496,6 @@ async def unlink_invoice_transaction(
     await db.commit()
     await db.refresh(invoice)
     return invoice
-
 
 
 
