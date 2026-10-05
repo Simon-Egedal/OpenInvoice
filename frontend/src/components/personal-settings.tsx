@@ -40,12 +40,12 @@ export function PersonalSettings() {
 
   return <section style={{ padding: "18px 0 28px", borderTop: "1px solid var(--line)" }}>
     <h2 className="section-heading">Your account</h2>
-    <form className="setup-form" onSubmit={event => save(event, "name")}>
+    <form className="setup-form personal-settings-form" onSubmit={event => save(event, "name")}>
       <label className="field"><span>Name</span><input autoComplete="name" value={name} onChange={event => setName(event.target.value)} required maxLength={200} disabled={!loaded || busy} /></label>
       <button className="button button-primary" disabled={!loaded || busy || !name.trim()}>Save name</button>
     </form>
     <h2 className="section-heading" style={{ marginTop: 28 }}>Change password</h2>
-    <form className="setup-form" onSubmit={event => save(event, "password")}>
+    <form className="setup-form personal-settings-form" onSubmit={event => save(event, "password")}>
       <label className="field"><span>Current password</span><input type="password" autoComplete="current-password" value={currentPassword} onChange={event => setCurrentPassword(event.target.value)} required disabled={busy} /></label>
       <label className="field"><span>New password</span><input type="password" autoComplete="new-password" value={password} onChange={event => setPassword(event.target.value)} required minLength={12} maxLength={256} disabled={busy} /></label>
       <p className="setup-hint">Use at least 12 characters.</p>

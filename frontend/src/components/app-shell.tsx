@@ -3,7 +3,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { API, api, CurrentUser, Invoice, Organization, SetupStatus } from "@/lib/api";
-import { Activity, Building2, ChevronDown, FileText, LayoutDashboard, LogIn, LogOut, Menu, Package, Settings, ShieldCheck, Users, WalletCards, X } from "lucide-react";
+import { Activity, Building2, ChevronDown, FileText, LayoutDashboard, LogOut, Menu, Package, Settings, ShieldCheck, Users, WalletCards, X } from "lucide-react";
 
 const links = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
@@ -151,7 +151,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         </button>
         <div className="nav-caption">WORKSPACE</div>
         <nav aria-label="Main navigation">
-          {links.map(({ href, label, icon: Icon }) => (
+          {links.filter(({ href }) => href !== "/audit" || ["owner", "admin"].includes(currentUser.role)).map(({ href, label, icon: Icon }) => (
             <Link
               key={href}
               href={href}
@@ -176,12 +176,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <Settings size={17} />
             Settings
           </Link>
-          {authChecked && (
-            <Link href="/auth" className={`nav-link ${path === "/auth" ? "active" : ""}`}>
-              <LogIn size={17} />
-              {currentUser ? "Switch account" : "Sign in"}
-            </Link>
-          )}
           {authChecked && currentUser && (
             <button type="button" className="nav-link" onClick={logout} disabled={loggingOut}>
               <LogOut size={17} />

@@ -1503,7 +1503,7 @@ async def bank_sync(m: OrganizationMember = Depends(current_membership), db: Asy
     }
 
 @router.get("/audit")
-async def audit(m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
+async def audit(m=Depends(admin_membership),db:AsyncSession=Depends(get_db)):
     result=await db.execute(select(AuditLog).where(AuditLog.organization_id==m.organization_id).order_by(AuditLog.created_at.desc()).limit(100)); return result.scalars().all()
 
 @router.get("/settings/infrastructure", response_model=InfrastructureSettingsOut)

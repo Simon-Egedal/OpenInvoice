@@ -10,3 +10,4 @@
 .logo-preview-box{display:flex;align-items:center;gap:14px;padding:12px 14px;border:1px solid var(--line);border-radius:6px;background:#fff}
 .logo-preview-thumb{width:52px;height:52px;object-fit:contain;border:1px solid var(--line);border-radius:5px;background:#fff;padding:3px}
 
+.personal-settings-form>.button{margin-top:12px}
