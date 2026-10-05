@@ -20,7 +20,7 @@ from app.models.entities import AuditLog, BankAccount, BankConnection, BankTrans
 from app.providers.banking import EnableBankingProvider, MockBankingProvider
 from app.providers.email import email_provider
 from app.providers.storage import storage_provider
-from app.schemas import BankAuthorizeIn, BankCallbackIn, CustomerIn, CustomerOut, InfrastructureSettingsIn, InfrastructureSettingsOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, RegisterIn, SetupAdminIn, SetupIn, SetupOrgOut, SupplierIn, SupplierOut, UserOut
+from app.schemas import BankAuthorizeIn, BankCallbackIn, CustomerIn, CustomerOut, InfrastructureSettingsIn, InfrastructureSettingsOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, OrganizationUpdateIn, RegisterIn, SetupAdminIn, SetupIn, SetupOrgOut, SupplierIn, SupplierOut, UserOut
 from app.services import create_initial_admin, create_initial_organization, create_invoice, get_infrastructure_config, money, prepare_infrastructure_update
 
 router=APIRouter()
@@ -246,14 +246,171 @@ async def login(payload:LoginIn,request:Request,db:AsyncSession=Depends(get_db))
 async def logout(request:Request): request.session.clear(); return Response(status_code=204)
 @router.get("/auth/me",response_model=UserOut)
 async def me(user:User=Depends(current_user)): return user
-@router.get("/organizations",response_model=list[OrganizationOut])
-async def organizations(user:User=Depends(current_user),db:AsyncSession=Depends(get_db)):
-    rows=await db.execute(select(Organization).join(OrganizationMember).where(OrganizationMember.user_id==user.id)); return rows.scalars().all()
-@router.post("/organizations",response_model=OrganizationOut,status_code=201)
-async def create_organization(payload:dict, user:User=Depends(current_user),db:AsyncSession=Depends(get_db)):
-    name=str(payload.get("name","")).strip()
-    if not name: raise HTTPException(422,"Organization name is required")
-    org=Organization(name=name,country=payload.get("country","DK"),currency=payload.get("currency","DKK")); db.add(org); await db.flush(); db.add(OrganizationMember(user_id=user.id,organization_id=org.id,role="owner")); await db.commit(); await db.refresh(org); return org
+@router.get("/organizations", response_model=list[OrganizationOut])
+async def organizations(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    rows = await db.execute(
+        select(Organization)
+        .join(OrganizationMember)
+        .where(OrganizationMember.user_id == user.id)
+    )
+    orgs = rows.scalars().all()
+    return [
+        {
+            "id": o.id,
+            "name": o.name,
+            "country": o.country,
+            "currency": o.currency,
+            "logo_key": o.logo_key,
+            "logo_url": f"/organizations/{o.id}/logo" if o.logo_key else None,
+        }
+        for o in orgs
+    ]
+
+@router.get("/organizations/current", response_model=OrganizationOut)
+async def get_current_organization(
+    m: OrganizationMember = Depends(current_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    org = await db.scalar(select(Organization).where(Organization.id == m.organization_id))
+    if not org:
+        raise HTTPException(404, "Organization not found")
+    return {
+        "id": org.id,
+        "name": org.name,
+        "country": org.country,
+        "currency": org.currency,
+        "logo_key": org.logo_key,
+        "logo_url": f"/organizations/{org.id}/logo" if org.logo_key else None,
+    }
+
+@router.patch("/organizations/current", response_model=OrganizationOut)
+async def update_current_organization(
+    payload: OrganizationUpdateIn,
+    user: User = Depends(current_user),
+    m: OrganizationMember = Depends(admin_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    org = await db.scalar(select(Organization).where(Organization.id == m.organization_id))
+    if not org:
+        raise HTTPException(404, "Organization not found")
+
+    org.name = payload.name.strip()
+    org.country = payload.country.strip().upper()
+    org.currency = payload.currency.strip().upper()
+
+    db.add(AuditLog(
+        organization_id=org.id,
+        user_id=user.id,
+        action="organization.updated",
+        entity_type="organization",
+        entity_id=org.id,
+        new_values={"name": org.name, "country": org.country, "currency": org.currency},
+    ))
+    await db.commit()
+    await db.refresh(org)
+
+    return {
+        "id": org.id,
+        "name": org.name,
+        "country": org.country,
+        "currency": org.currency,
+        "logo_key": org.logo_key,
+        "logo_url": f"/organizations/{org.id}/logo" if org.logo_key else None,
+    }
+
+@router.post("/organizations/current/logo", response_model=OrganizationOut)
+async def upload_current_organization_logo(
+    logo: UploadFile = File(...),
+    user: User = Depends(current_user),
+    m: OrganizationMember = Depends(admin_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    org = await db.scalar(select(Organization).where(Organization.id == m.organization_id))
+    if not org:
+        raise HTTPException(404, "Organization not found")
+
+    logo_bytes = await logo.read(5 * 1024 * 1024 + 1)
+    if len(logo_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(413, "Logo image must be 5 MB or smaller")
+    content_type = logo.content_type or "image/png"
+    if not (content_type.startswith("image/") or (logo.filename and logo.filename.lower().endswith((".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif")))):
+        raise HTTPException(415, "Only image files (PNG, JPG, SVG, WebP) are accepted for the organization logo")
+
+    safe_name = (logo.filename or "logo.png").replace("\\", "/").split("/")[-1][:255] or "logo.png"
+    logo_key = await storage_provider().put(logo_bytes, safe_name, content_type)
+    org.logo_key = logo_key
+
+    db.add(AuditLog(
+        organization_id=org.id,
+        user_id=user.id,
+        action="organization.logo_updated",
+        entity_type="organization",
+        entity_id=org.id,
+        new_values={"logo_key": logo_key},
+    ))
+    await db.commit()
+    await db.refresh(org)
+
+    return {
+        "id": org.id,
+        "name": org.name,
+        "country": org.country,
+        "currency": org.currency,
+        "logo_key": org.logo_key,
+        "logo_url": f"/organizations/{org.id}/logo" if org.logo_key else None,
+    }
+
+@router.delete("/organizations/current/logo", response_model=OrganizationOut)
+async def delete_current_organization_logo(
+    user: User = Depends(current_user),
+    m: OrganizationMember = Depends(admin_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    org = await db.scalar(select(Organization).where(Organization.id == m.organization_id))
+    if not org:
+        raise HTTPException(404, "Organization not found")
+
+    org.logo_key = None
+    db.add(AuditLog(
+        organization_id=org.id,
+        user_id=user.id,
+        action="organization.logo_deleted",
+        entity_type="organization",
+        entity_id=org.id,
+        new_values={"logo_key": None},
+    ))
+    await db.commit()
+    await db.refresh(org)
+
+    return {
+        "id": org.id,
+        "name": org.name,
+        "country": org.country,
+        "currency": org.currency,
+        "logo_key": None,
+        "logo_url": None,
+    }
+
+@router.post("/organizations", response_model=OrganizationOut, status_code=201)
+async def create_organization(payload: dict, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise HTTPException(422, "Organization name is required")
+    org = Organization(name=name, country=payload.get("country", "DK"), currency=payload.get("currency", "DKK"))
+    db.add(org)
+    await db.flush()
+    db.add(OrganizationMember(user_id=user.id, organization_id=org.id, role="owner"))
+    await db.commit()
+    await db.refresh(org)
+    return {
+        "id": org.id,
+        "name": org.name,
+        "country": org.country,
+        "currency": org.currency,
+        "logo_key": org.logo_key,
+        "logo_url": f"/organizations/{org.id}/logo" if org.logo_key else None,
+    }
+
 
 async def entity_list(model, db, org_id):
     result=await db.execute(select(model).where(model.organization_id==org_id).order_by(model.name)); return result.scalars().all()

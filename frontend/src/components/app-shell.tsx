@@ -41,11 +41,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (path.startsWith("/setup") || path === "/auth") return;
-    api<Organization[]>("/organizations")
-      .then((orgs) => {
-        if (orgs && orgs.length > 0) setCurrentOrg(orgs[0]);
-      })
-      .catch(() => {});
+    const fetchOrg = () => {
+      api<Organization[]>("/organizations")
+        .then((orgs) => {
+          if (orgs && orgs.length > 0) setCurrentOrg(orgs[0]);
+        })
+        .catch(() => {});
+    };
+    fetchOrg();
+    window.addEventListener("organizationUpdated", fetchOrg);
+
     api<Invoice[]>("/invoices")
       .then((items) => {
         setInvoiceCount(Array.isArray(items) ? items.length : 0);
@@ -53,7 +58,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       .catch(() => {
         setInvoiceCount(null);
       });
+
+    return () => {
+      window.removeEventListener("organizationUpdated", fetchOrg);
+    };
   }, [path]);
+
 
   if (path === "/setup" || path.startsWith("/setup/")) {
     return <main className="setup-shell">{children}</main>;

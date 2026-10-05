@@ -69,7 +69,24 @@ class InfrastructureSettingsOut(BaseModel):
     session_cookie_secure: bool = False
     restart_required: bool = False
 class UserOut(ORMModel): id: UUID; email: EmailStr; full_name: str
-class OrganizationOut(ORMModel): id: UUID; name: str; country: str; currency: str; logo_key: str | None = None
+class OrganizationOut(ORMModel):
+    id: UUID
+    name: str
+    country: str
+    currency: str
+    logo_key: str | None = None
+    logo_url: str | None = None
+
+class OrganizationUpdateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    country: str = Field(default="DK", min_length=2, max_length=2)
+    currency: str = Field(default="DKK", min_length=1, max_length=10)
+
+    @field_validator("name", "country", "currency", mode="before")
+    @classmethod
+    def clean_strings(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
 class SetupAdminIn(BaseModel):
     full_name: str = Field(min_length=1, max_length=200)
     email: EmailStr

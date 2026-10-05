@@ -119,3 +119,11 @@ def test_prepare_infrastructure_update_preserves_existing_secrets_when_blank():
     assert values["enable_banking_app_id"] == "app-123"
     assert "external-db.example.com" in url
     assert "existing-db-pw" in url
+
+def test_organization_update_schema_normalizes_and_validates():
+    from app.schemas import OrganizationUpdateIn
+    update = OrganizationUpdateIn(name="  Acme International ApS  ", country="dk", currency="eur")
+    assert update.name == "Acme International ApS"
+    assert update.country == "dk"
+    assert update.currency == "eur"
+
