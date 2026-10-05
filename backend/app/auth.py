@@ -31,3 +31,9 @@ async def write_membership(membership: OrganizationMember=Depends(current_member
     if membership.role not in {"owner", "admin", "accountant", "member"}:
         raise HTTPException(403,"Your organization role cannot make this change")
     return membership
+
+async def admin_membership(membership: OrganizationMember=Depends(current_membership))->OrganizationMember:
+    if membership.role not in {"owner", "admin"}:
+        raise HTTPException(403,"Only organization administrators can manage infrastructure configuration")
+    return membership
+

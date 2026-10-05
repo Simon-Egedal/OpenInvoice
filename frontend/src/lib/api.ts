@@ -24,4 +24,32 @@ export type Organization = {
   logo_key?: string | null;
   logo_url?: string | null;
 };
+export type InfrastructureConfig = {
+  can_manage: boolean;
+  database_mode: "bundled" | "external";
+  database_host: string;
+  database_port: number;
+  database_name: string;
+  database_username: string;
+  database_ssl: boolean;
+  has_database_password: boolean;
+  email_provider: "console" | "smtp";
+  smtp_host: string;
+  smtp_port: number;
+  smtp_username: string;
+  smtp_from: string;
+  smtp_use_tls: boolean;
+  has_smtp_password: boolean;
+  storage_provider: "local" | "s3";
+  s3_endpoint_url: string;
+  s3_bucket: string;
+  s3_access_key_id: string;
+  s3_region: string;
+  has_s3_secret: boolean;
+  banking_provider: "mock" | "enable_banking";
+  enable_banking_app_id: string;
+  enable_banking_private_key_path: string;
+  session_cookie_secure: boolean;
+  restart_required: boolean;
+};
 

@@ -1,8 +1,11 @@
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Any
 from uuid import UUID
 from sqlalchemy import select
+from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import hash_password
+from app.core.runtime_config import settings_are_applied
 from app.models.entities import AuditLog, Invoice, InvoiceLine, MemberRole, Organization, OrganizationMember, User
 from app.providers.storage import storage_provider
 
@@ -105,5 +108,96 @@ async def create_initial_admin(
     await db.commit()
     await db.refresh(user)
     return user, org
+
+def get_infrastructure_config(saved: dict | None, runtime_settings: Any) -> dict:
+    saved = saved or {}
+    db_mode = saved.get("database_mode", "bundled")
+    restart_required = not settings_are_applied(runtime_settings, saved) if saved.get("setup_completed") else False
+
+    return {
+        "can_manage": True,
+        "database_mode": db_mode,
+        "database_host": saved.get("database_host", runtime_settings.postgres_host or "localhost"),
+        "database_port": int(saved.get("database_port", 5432)),
+        "database_name": saved.get("database_name", runtime_settings.postgres_db or "openinvoice"),
+        "database_username": saved.get("database_username", runtime_settings.postgres_user or "openinvoice"),
+        "database_ssl": bool(saved.get("database_ssl", False)),
+        "has_database_password": bool(saved.get("database_password") or runtime_settings.postgres_password),
+        "email_provider": saved.get("email_provider", runtime_settings.email_provider or "console"),
+        "smtp_host": saved.get("smtp_host", runtime_settings.smtp_host or ""),
+        "smtp_port": int(saved.get("smtp_port", runtime_settings.smtp_port or 587)),
+        "smtp_username": saved.get("smtp_username", runtime_settings.smtp_username or ""),
+        "smtp_from": saved.get("smtp_from", runtime_settings.smtp_from or "OpenInvoice <invoices@example.com>"),
+        "smtp_use_tls": bool(saved.get("smtp_use_tls", runtime_settings.smtp_use_tls)),
+        "has_smtp_password": bool(saved.get("smtp_password") or runtime_settings.smtp_password),
+        "storage_provider": saved.get("storage_provider", runtime_settings.storage_provider or "local"),
+        "s3_endpoint_url": saved.get("s3_endpoint_url", runtime_settings.s3_endpoint_url or ""),
+        "s3_bucket": saved.get("s3_bucket", runtime_settings.s3_bucket or ""),
+        "s3_access_key_id": saved.get("s3_access_key_id", runtime_settings.s3_access_key_id or ""),
+        "s3_region": saved.get("s3_region", runtime_settings.s3_region or "eu-central-1"),
+        "has_s3_secret": bool(saved.get("s3_secret_access_key") or runtime_settings.s3_secret_access_key),
+        "banking_provider": saved.get("banking_provider", runtime_settings.banking_provider or "mock"),
+        "enable_banking_app_id": saved.get("enable_banking_app_id", runtime_settings.enable_banking_app_id or ""),
+        "enable_banking_private_key_path": saved.get("enable_banking_private_key_path", runtime_settings.enable_banking_private_key_path or ""),
+        "session_cookie_secure": bool(saved.get("session_cookie_secure", runtime_settings.session_cookie_secure)),
+        "restart_required": restart_required,
+    }
+
+def prepare_infrastructure_update(
+    payload: Any,
+    saved: dict | None,
+    runtime_settings: Any,
+) -> tuple[dict, str]:
+    saved = saved or {}
+    db_password = payload.database_password or saved.get("database_password") or runtime_settings.postgres_password or ""
+    smtp_password = payload.smtp_password or saved.get("smtp_password") or runtime_settings.smtp_password or ""
+    s3_secret = payload.s3_secret_access_key or saved.get("s3_secret_access_key") or runtime_settings.s3_secret_access_key or ""
+
+    if payload.database_mode == "external":
+        database_url = URL.create(
+            "postgresql+asyncpg",
+            username=payload.database_username,
+            password=db_password,
+            host=payload.database_host,
+            port=payload.database_port,
+            database=payload.database_name,
+        )
+        if payload.database_ssl:
+            database_url = database_url.update_query_dict({"ssl": "require"})
+        url = database_url.render_as_string(hide_password=False)
+    else:
+        url = runtime_settings.database_url
+
+    values = {
+        "setup_completed": True,
+        "database_mode": payload.database_mode,
+        "database_host": payload.database_host,
+        "database_port": payload.database_port,
+        "database_name": payload.database_name,
+        "database_username": payload.database_username,
+        "database_password": db_password,
+        "database_ssl": payload.database_ssl,
+        "database_url": url,
+        "email_provider": payload.email_provider,
+        "smtp_host": payload.smtp_host,
+        "smtp_port": payload.smtp_port,
+        "smtp_username": payload.smtp_username,
+        "smtp_password": smtp_password,
+        "smtp_from": payload.smtp_from,
+        "smtp_use_tls": payload.smtp_use_tls,
+        "storage_provider": payload.storage_provider,
+        "s3_endpoint_url": payload.s3_endpoint_url,
+        "s3_bucket": payload.s3_bucket,
+        "s3_access_key_id": payload.s3_access_key_id,
+        "s3_secret_access_key": s3_secret,
+        "s3_region": payload.s3_region,
+        "banking_provider": payload.banking_provider,
+        "enable_banking_app_id": payload.enable_banking_app_id,
+        "enable_banking_private_key_path": payload.enable_banking_private_key_path,
+        "session_cookie_secure": payload.session_cookie_secure,
+        "local_storage_path": runtime_settings.local_storage_path,
+    }
+    return values, url
+
 
 

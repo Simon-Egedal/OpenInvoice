@@ -12,7 +12,7 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.auth import current_membership, current_user, hash_password, verify_password, write_membership
+from app.auth import admin_membership, current_membership, current_user, hash_password, verify_password, write_membership
 from app.core.config import settings
 from app.core.runtime_config import config_path, read_saved_settings, save_settings, settings_are_applied
 from app.db.session import get_db
@@ -20,8 +20,8 @@ from app.models.entities import AuditLog, BankAccount, Customer, EmailDelivery, 
 from app.providers.banking import EnableBankingProvider, MockBankingProvider
 from app.providers.email import email_provider
 from app.providers.storage import storage_provider
-from app.schemas import CustomerIn, CustomerOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, RegisterIn, SetupAdminIn, SetupIn, SetupOrgOut, SupplierIn, SupplierOut, UserOut
-from app.services import create_initial_admin, create_initial_organization, create_invoice, money
+from app.schemas import CustomerIn, CustomerOut, InfrastructureSettingsIn, InfrastructureSettingsOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, RegisterIn, SetupAdminIn, SetupIn, SetupOrgOut, SupplierIn, SupplierOut, UserOut
+from app.services import create_initial_admin, create_initial_organization, create_invoice, get_infrastructure_config, money, prepare_infrastructure_update
 
 router=APIRouter()
 setup_lock=asyncio.Lock()
@@ -98,7 +98,7 @@ async def configure_installation(payload:SetupIn):
         if payload.storage_provider=="s3":
             try: await asyncio.to_thread(verify_s3,payload)
             except Exception as exc: raise HTTPException(422,"Could not access the S3 bucket. Check its endpoint, region, name, and credentials.") from exc
-        values=payload.model_dump(exclude={"database_host","database_port","database_name","database_username","database_password","database_ssl"})
+        values=payload.model_dump()
         values.update({"database_url":url,"setup_completed":True,"local_storage_path":settings.local_storage_path})
         if payload.storage_provider=="local":
             from pathlib import Path
@@ -395,3 +395,68 @@ async def bank_authorize(m=Depends(current_membership)):
 @router.get("/audit")
 async def audit(m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
     result=await db.execute(select(AuditLog).where(AuditLog.organization_id==m.organization_id).order_by(AuditLog.created_at.desc()).limit(100)); return result.scalars().all()
+
+@router.get("/settings/infrastructure", response_model=InfrastructureSettingsOut)
+async def get_settings_infrastructure(
+    m: OrganizationMember = Depends(admin_membership),
+):
+    saved = read_saved_settings()
+    return get_infrastructure_config(saved, settings)
+
+@router.put("/settings/infrastructure", response_model=InfrastructureSettingsOut)
+async def update_settings_infrastructure(
+    payload: InfrastructureSettingsIn,
+    user: User = Depends(current_user),
+    m: OrganizationMember = Depends(admin_membership),
+    db: AsyncSession = Depends(get_db),
+):
+    saved = read_saved_settings()
+    values, url = prepare_infrastructure_update(payload, saved, settings)
+
+    try:
+        await verify_database(url)
+    except Exception as exc:
+        raise HTTPException(422, "Could not connect to PostgreSQL. Check the host, database, credentials, and network access.") from exc
+
+    if payload.email_provider == "smtp":
+        try:
+            temp_setup = SetupIn(**{**payload.model_dump(), "smtp_password": values["smtp_password"]})
+            await asyncio.to_thread(verify_smtp, temp_setup)
+        except Exception as exc:
+            raise HTTPException(422, "Could not connect to SMTP. Check the server, TLS setting, and credentials.") from exc
+
+    if payload.storage_provider == "s3":
+        try:
+            temp_setup = SetupIn(**{**payload.model_dump(), "s3_secret_access_key": values["s3_secret_access_key"]})
+            await asyncio.to_thread(verify_s3, temp_setup)
+        except Exception as exc:
+            raise HTTPException(422, "Could not access the S3 bucket. Check its endpoint, region, name, and credentials.") from exc
+
+    if payload.storage_provider == "local":
+        from pathlib import Path
+        import tempfile
+        try:
+            Path(settings.local_storage_path).mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=settings.local_storage_path):
+                pass
+        except OSError as exc:
+            raise HTTPException(422, "The local storage directory is not writable") from exc
+
+    save_settings(values)
+    db.add(AuditLog(
+        organization_id=m.organization_id,
+        user_id=user.id,
+        action="infrastructure.updated",
+        entity_type="system",
+        entity_id=m.organization_id,
+        new_values={
+            "database_mode": payload.database_mode,
+            "banking_provider": payload.banking_provider,
+            "email_provider": payload.email_provider,
+            "storage_provider": payload.storage_provider,
+        }
+    ))
+    await db.commit()
+
+    return get_infrastructure_config(values, settings)
+

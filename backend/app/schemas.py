@@ -39,6 +39,35 @@ class SetupIn(BaseModel):
     @classmethod
     def strip_configuration_text(cls, value):
         return value.strip() if isinstance(value, str) else value
+class InfrastructureSettingsIn(SetupIn):
+    pass
+class InfrastructureSettingsOut(BaseModel):
+    can_manage: bool = True
+    database_mode: str = "bundled"
+    database_host: str = "localhost"
+    database_port: int = 5432
+    database_name: str = "openinvoice"
+    database_username: str = "openinvoice"
+    database_ssl: bool = False
+    has_database_password: bool = False
+    email_provider: str = "console"
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_from: str = ""
+    smtp_use_tls: bool = True
+    has_smtp_password: bool = False
+    storage_provider: str = "local"
+    s3_endpoint_url: str = ""
+    s3_bucket: str = ""
+    s3_access_key_id: str = ""
+    s3_region: str = "eu-central-1"
+    has_s3_secret: bool = False
+    banking_provider: str = "mock"
+    enable_banking_app_id: str = ""
+    enable_banking_private_key_path: str = ""
+    session_cookie_secure: bool = False
+    restart_required: bool = False
 class UserOut(ORMModel): id: UUID; email: EmailStr; full_name: str
 class OrganizationOut(ORMModel): id: UUID; name: str; country: str; currency: str; logo_key: str | None = None
 class SetupAdminIn(BaseModel):
