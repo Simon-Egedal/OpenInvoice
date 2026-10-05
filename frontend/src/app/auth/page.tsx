@@ -26,7 +26,7 @@ export default function AuthPage() {
         method: "POST",
         body: JSON.stringify({ email: data.email, password: data.password }),
       });
-      router.push("/");
+      router.replace("/");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unable to sign in");
     } finally {

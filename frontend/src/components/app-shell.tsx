@@ -21,7 +21,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = useState(false);
   const [currentOrg, setCurrentOrg] = useState<Organization | null>(null);
   const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
-  const [authChecked, setAuthChecked] = useState(false);
+  const [authCheckedPath, setAuthCheckedPath] = useState<string | null>(null);
+  const authChecked = authCheckedPath === path;
   const [loggingOut, setLoggingOut] = useState(false);
   const [authError, setAuthError] = useState("");
   const [invoiceCount, setInvoiceCount] = useState<number | null>(null);
@@ -45,11 +46,19 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   }, [path, router]);
 
   useEffect(() => {
-    setAuthChecked(false);
+    let active = true;
+    setAuthCheckedPath(null);
     api<CurrentUser>("/auth/me")
-      .then(setCurrentUser)
-      .catch(() => setCurrentUser(null))
-      .finally(() => setAuthChecked(true));
+      .then((user) => {
+        if (active) setCurrentUser(user);
+      })
+      .catch(() => {
+        if (active) setCurrentUser(null);
+      })
+      .finally(() => {
+        if (active) setAuthCheckedPath(path);
+      });
+    return () => { active = false; };
   }, [path]);
 
   useEffect(() => {
@@ -64,7 +73,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     try {
       await api<void>("/auth/logout", { method: "POST" });
       setCurrentUser(null);
-      setAuthChecked(true);
+      setAuthCheckedPath(path);
       setOpen(false);
       router.push("/auth");
     } catch (e) {
