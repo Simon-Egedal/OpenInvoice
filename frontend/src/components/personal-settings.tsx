@@ -2,8 +2,10 @@
 
 import { useEffect, useState } from "react";
 import { api, CurrentUser } from "@/lib/api";
+import { useRouter } from "next/navigation";
 
 export function PersonalSettings() {
+  const router = useRouter();
   const [name, setName] = useState("");
   const [loaded, setLoaded] = useState(false);
   const [currentPassword, setCurrentPassword] = useState("");
@@ -44,6 +46,12 @@ export function PersonalSettings() {
       <label className="field"><span>Name</span><input autoComplete="name" value={name} onChange={event => setName(event.target.value)} required maxLength={200} disabled={!loaded || busy} /></label>
       <button className="button button-primary" disabled={!loaded || busy || !name.trim()}>Save name</button>
     </form>
+    <button className="button" disabled={busy} onClick={async () => {
+      setBusy(true); setError("");
+      try { await api("/auth/revoke-sessions", {method: "POST"}); router.push("/auth"); }
+      catch (e) { setError(e instanceof Error ? e.message : "Unable to revoke sessions"); }
+      finally { setBusy(false); }
+    }}>Sign out all sessions</button>
     <h2 className="section-heading" style={{ marginTop: 28 }}>Change password</h2>
     <form className="setup-form personal-settings-form" onSubmit={event => save(event, "password")}>
       <label className="field"><span>Current password</span><input type="password" autoComplete="current-password" value={currentPassword} onChange={event => setCurrentPassword(event.target.value)} required disabled={busy} /></label>

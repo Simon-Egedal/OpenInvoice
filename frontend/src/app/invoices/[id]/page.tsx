@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import {
   ArrowLeft,
   CheckCircle,
@@ -23,7 +23,11 @@ import {
   LinkableTransaction,
   Organization,
   Party,
+  CurrentUser,
 } from "@/lib/api";
+
+import { InvoiceWorkflow } from "@/components/invoice-workflow";
+import { minAmount, scaled, formatMoney } from "@/lib/money";
 
 type Line = {
   id: string;
@@ -44,6 +48,9 @@ export default function InvoiceDetail() {
   const [matches, setMatches] = useState<InvoiceMatch[]>([]);
   const [linkableTransactions, setLinkableTransactions] = useState<LinkableTransaction[]>([]);
   const [error, setError] = useState("");
+  const [role, setRole] = useState("");
+  const sendKey = useRef("");
+  const sendBusy = useRef(false);
 
   // Modals state
   const [showPayModal, setShowPayModal] = useState(false);
@@ -61,13 +68,16 @@ export default function InvoiceDetail() {
 
   const loadData = useCallback(async () => {
     try {
-      const [inv, lns, pmts, mtchs, orgs] = await Promise.all([
+      const [inv, lns, pmts, mtchs, orgs, user] = await Promise.all([
         api<Invoice>(`/invoices/${id}`),
-        api<Line[]>(`/invoices/${id}/lines`).catch(() => []),
-        api<InvoicePayment[]>(`/invoices/${id}/payments`).catch(() => []),
-        api<InvoiceMatch[]>(`/invoices/${id}/matches`).catch(() => []),
-        api<Organization[]>("/organizations").catch(() => []),
+        api<Line[]>(`/invoices/${id}/lines`),
+        api<InvoicePayment[]>(`/invoices/${id}/payments`),
+        api<InvoiceMatch[]>(`/invoices/${id}/matches`),
+        api<Organization[]>("/organizations"),
+        api<CurrentUser>("/auth/me"),
       ]);
+      setError("");
+      setRole(user.role);
       setInvoice(inv);
       setLines(lns);
       setPayments(pmts);
@@ -78,14 +88,16 @@ export default function InvoiceDetail() {
         setOrg(found || orgs[0]);
       }
 
-      if (inv.customer_id) {
+      if (inv.issued_at) {
+        setParty(null);
+      } else if (inv.customer_id) {
         api<Party>(`/customers/${inv.customer_id}`)
           .then(setParty)
-          .catch(() => {});
+          .catch(e => setError(e instanceof Error ? e.message : "Unable to load party details"));
       } else if (inv.supplier_id) {
         api<Party>(`/suppliers/${inv.supplier_id}`)
           .then(setParty)
-          .catch(() => {});
+          .catch(e => setError(e instanceof Error ? e.message : "Unable to load party details"));
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load invoice");
@@ -97,18 +109,22 @@ export default function InvoiceDetail() {
   }, [loadData]);
 
   async function send() {
+    if (sendBusy.current) return;
+    sendBusy.current = true; setSubmitting(true); setError("");
+    if (!sendKey.current) sendKey.current = crypto.randomUUID();
     try {
-      await api(`/invoices/${id}/send`, { method: "POST" });
-      setInvoice((v) => (v ? { ...v, status: "sent" } : v));
+      await api(`/invoices/${id}/send`, { method: "POST", headers: {"Idempotency-Key": sendKey.current} });
+      sendKey.current = "";
+      await loadData();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Email failed");
-    }
+    } finally { sendBusy.current = false; setSubmitting(false); }
   }
 
   function openPayModal() {
     if (!invoice) return;
     setPayMode("full");
-    setPayAmount(Number(invoice.due_amount) > 0 ? invoice.due_amount : invoice.total);
+    setPayAmount(scaled(String(invoice.due_amount)) > 0n ? invoice.due_amount : invoice.total);
     setPayMethod("manual");
     setPayRef("");
     setPayNotes("");
@@ -122,7 +138,7 @@ export default function InvoiceDetail() {
     setError("");
     try {
       const amount =
-        payMode === "full" ? undefined : parseFloat(payAmount.replace(",", "."));
+        payMode === "full" ? undefined : payAmount.replace(",", ".");
       await api(`/invoices/${id}/payments`, {
         method: "POST",
         body: JSON.stringify({
@@ -162,7 +178,7 @@ export default function InvoiceDetail() {
     setShowLinkModal(true);
     try {
       const txs = await api<LinkableTransaction[]>(`/invoices/${id}/linkable-transactions`);
-      setLinkableTransactions(txs.filter((t) => Number(t.available_amount) > 0));
+      setLinkableTransactions(txs.filter((t) => scaled(String(t.available_amount)) > 0n));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to fetch linkable transactions");
     }
@@ -171,10 +187,7 @@ export default function InvoiceDetail() {
   function handleSelectTx(tx: LinkableTransaction) {
     setSelectedTxId(tx.id);
     if (!invoice) return;
-    const due = Number(invoice.due_amount);
-    const avail = Number(tx.available_amount);
-    const suggested = Math.min(due > 0 ? due : Number(invoice.total), avail);
-    setLinkAmount(suggested.toFixed(2));
+    setLinkAmount(minAmount(invoice.due_amount, tx.available_amount));
   }
 
   async function handleLinkTransaction(e: React.FormEvent) {
@@ -183,7 +196,7 @@ export default function InvoiceDetail() {
     setSubmitting(true);
     setError("");
     try {
-      const parsedAmount = linkAmount ? parseFloat(linkAmount.replace(",", ".")) : undefined;
+      const parsedAmount = linkAmount ? linkAmount.replace(",", ".") : undefined;
       await api(`/invoices/${id}/link-transaction`, {
         method: "POST",
         body: JSON.stringify({
@@ -222,11 +235,13 @@ export default function InvoiceDetail() {
     );
   }
 
-  const isFullyPaid = Number(invoice.due_amount) <= 0;
+  const canWrite = ["owner", "admin", "accountant", "member"].includes(role);
+  const isFullyPaid = scaled(String(invoice.due_amount)) <= 0n;
+  const canPay = canWrite && !isFullyPaid && ["issued", "sent", "approved", "partially_paid", "overdue"].includes(invoice.status);
   const orgDisplayName = invoice.organization_name || org?.name || "Organization";
   const orgLogoUrl = invoice.organization_logo_url
     ? `${API}/api/v1${invoice.organization_logo_url}`
-    : org?.logo_key
+    : !invoice.issued_at && org?.logo_key
     ? `${API}/api/v1/organizations/${org.id}/logo`
     : null;
 
@@ -272,7 +287,7 @@ export default function InvoiceDetail() {
           </p>
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          {invoice.status === "draft" && invoice.invoice_type === "outgoing" && (
+          {canWrite && invoice.status === "draft" && invoice.invoice_type === "outgoing" && (
             <Link className="button" href={`/invoices/${id}/edit`}>
               <Pencil size={14} />
               Edit draft
@@ -287,22 +302,22 @@ export default function InvoiceDetail() {
             <Download size={14} />
             PDF
           </a>
-          {invoice.invoice_type === "outgoing" && invoice.status !== "paid" && (
-            <button className="button" onClick={send}>
+          {canWrite && invoice.invoice_type === "outgoing" && !["cancelled", "rejected"].includes(invoice.status) && (
+            <button className="button" onClick={send} disabled={submitting || !canWrite}>
               <Send size={14} />
               Send invoice
             </button>
           )}
-          {!isFullyPaid && (
+          {canPay && (
             <>
-              <button className="button" onClick={openLinkModal} disabled={submitting}>
+              <button className="button" onClick={openLinkModal} disabled={submitting || !canWrite}>
                 <Link2 size={14} />
                 Link transaction
               </button>
               <button
                 className="button button-primary"
                 onClick={openPayModal}
-                disabled={submitting}
+                disabled={submitting || !canWrite}
               >
                 <CheckCircle size={14} />
                 Mark as paid
@@ -311,6 +326,7 @@ export default function InvoiceDetail() {
           )}
         </div>
       </header>
+      <InvoiceWorkflow invoice={invoice} onChange={loadData}/>
 
       {/* Organization and Recipient Branding Card */}
       <div
@@ -422,14 +438,14 @@ export default function InvoiceDetail() {
         <div className="metric">
           <div className="metric-label">Total amount</div>
           <div className="metric-value">
-            {invoice.currency} {Number(invoice.total).toLocaleString("en-DK", { minimumFractionDigits: 2 })}
+            {invoice.currency} {formatMoney(String(invoice.total))}
           </div>
           <div className="metric-note">Subtotal + VAT</div>
         </div>
         <div className="metric">
           <div className="metric-label">Paid to date</div>
-          <div className="metric-value" style={{ color: Number(invoice.paid_amount) > 0 ? "#3d7150" : undefined }}>
-            {invoice.currency} {Number(invoice.paid_amount || 0).toLocaleString("en-DK", { minimumFractionDigits: 2 })}
+          <div className="metric-value" style={{ color: scaled(String(invoice.paid_amount)) > 0n ? "#3d7150" : undefined }}>
+            {invoice.currency} {formatMoney(String(invoice.paid_amount || 0))}
           </div>
           <div className="metric-note">
             {matches.length + payments.length} payment record{matches.length + payments.length === 1 ? "" : "s"}
@@ -440,10 +456,10 @@ export default function InvoiceDetail() {
           <div
             className="metric-value"
             style={{
-              color: isFullyPaid ? "#3d7150" : Number(invoice.paid_amount) > 0 ? "#a05e24" : undefined,
+              color: isFullyPaid ? "#3d7150" : scaled(String(invoice.paid_amount)) > 0n ? "#a05e24" : undefined,
             }}
           >
-            {invoice.currency} {Number(invoice.due_amount || 0).toLocaleString("en-DK", { minimumFractionDigits: 2 })}
+            {invoice.currency} {formatMoney(String(invoice.due_amount || 0))}
           </div>
           <div className="metric-note">
             {isFullyPaid ? "Fully settled" : "Remaining to pay"}
@@ -548,10 +564,10 @@ export default function InvoiceDetail() {
               <tr key={line.id}>
                 <td className="td-strong">{line.description}</td>
                 <td className="mono">{line.quantity}</td>
-                <td className="mono">{Number(line.unit_price).toFixed(2)}</td>
+                <td className="mono">{formatMoney(String(line.unit_price))}</td>
                 <td className="mono">{line.tax_rate}%</td>
                 <td className="mono" style={{ textAlign: "right" }}>
-                  {Number(line.line_total).toFixed(2)}
+                  {formatMoney(String(line.line_total))}
                 </td>
               </tr>
             ))}
@@ -563,27 +579,27 @@ export default function InvoiceDetail() {
         <div className="invoice-total-row">
           <span>Subtotal</span>
           <span className="mono">
-            {invoice.currency} {Number(invoice.subtotal).toFixed(2)}
+            {invoice.currency} {formatMoney(String(invoice.subtotal))}
           </span>
         </div>
         <div className="invoice-total-row">
           <span>VAT</span>
           <span className="mono">
-            {invoice.currency} {Number(invoice.tax_amount).toFixed(2)}
+            {invoice.currency} {formatMoney(String(invoice.tax_amount))}
           </span>
         </div>
         <div className="invoice-total-row final">
           <span>Total</span>
           <span className="mono">
-            {invoice.currency} {Number(invoice.total).toFixed(2)}
+            {invoice.currency} {formatMoney(String(invoice.total))}
           </span>
         </div>
-        {Number(invoice.paid_amount) > 0 && (
+        {scaled(String(invoice.paid_amount)) > 0n && (
           <>
             <div className="invoice-total-row" style={{ color: "#3d7150" }}>
               <span>Total paid</span>
               <span className="mono">
-                - {invoice.currency} {Number(invoice.paid_amount).toFixed(2)}
+                - {invoice.currency} {formatMoney(String(invoice.paid_amount))}
               </span>
             </div>
             <div className="invoice-total-row final" style={{ borderTop: "1px solid var(--line)" }}>
@@ -592,7 +608,7 @@ export default function InvoiceDetail() {
                 className="mono"
                 style={{ color: isFullyPaid ? "#3d7150" : "#a05e24" }}
               >
-                {invoice.currency} {Number(invoice.due_amount).toFixed(2)}
+                {invoice.currency} {formatMoney(String(invoice.due_amount))}
               </span>
             </div>
           </>
@@ -610,13 +626,13 @@ export default function InvoiceDetail() {
         <div className="section-heading">
           <span>Payments & Linked Transactions</span>
           <div style={{ display: "flex", gap: 8 }}>
-            {!isFullyPaid && (
+            {canPay && (
               <>
                 <button
                   className="button"
                   onClick={openLinkModal}
                   style={{ fontSize: 11, padding: "5px 9px" }}
-                  disabled={submitting}
+                  disabled={submitting || !canWrite}
                 >
                   <Link2 size={12} />
                   Link transaction
@@ -625,7 +641,7 @@ export default function InvoiceDetail() {
                   className="button button-primary"
                   onClick={openPayModal}
                   style={{ fontSize: 11, padding: "5px 9px" }}
-                  disabled={submitting}
+                  disabled={submitting || !canWrite}
                 >
                   <CheckCircle size={12} />
                   Record payment
@@ -672,14 +688,14 @@ export default function InvoiceDetail() {
                           <td>{m.transaction_counterparty || "—"}</td>
                           <td className="mono">{m.transaction_reference ?? "—"}</td>
                           <td className="mono" style={{ textAlign: "right", color: "#3d7150", fontWeight: 600 }}>
-                            {invoice.currency} {Number(m.amount).toLocaleString("en-DK", { minimumFractionDigits: 2 })}
+                            {invoice.currency} {formatMoney(String(m.amount))}
                           </td>
                           <td style={{ textAlign: "right" }}>
                             <button
                               className="button"
                               style={{ padding: "4px 8px", fontSize: 11, color: "#a34d43" }}
                               onClick={() => handleUnlinkMatch(m.id)}
-                              disabled={submitting}
+                              disabled={submitting || !canWrite}
                               title="Unlink transaction"
                             >
                               <Unlink size={12} />
@@ -722,14 +738,14 @@ export default function InvoiceDetail() {
                           <td className="mono">{p.reference ?? "—"}</td>
                           <td>{p.notes ?? "—"}</td>
                           <td className="mono" style={{ textAlign: "right", color: "#3d7150", fontWeight: 600 }}>
-                            {invoice.currency} {Number(p.amount).toLocaleString("en-DK", { minimumFractionDigits: 2 })}
+                            {invoice.currency} {formatMoney(String(p.amount))}
                           </td>
                           <td style={{ textAlign: "right" }}>
                             <button
                               className="button"
                               style={{ padding: "4px 8px", fontSize: 11, color: "#a34d43" }}
                               onClick={() => handleDeletePayment(p.id)}
-                              disabled={submitting}
+                              disabled={submitting || !canWrite}
                               title="Delete payment"
                             >
                               <Trash2 size={12} />
@@ -774,7 +790,7 @@ export default function InvoiceDetail() {
                       setPayAmount(invoice.due_amount);
                     }}
                   >
-                    Full Due ({invoice.currency} {Number(invoice.due_amount).toFixed(2)})
+                    Full Due ({invoice.currency} {formatMoney(String(invoice.due_amount))})
                   </button>
                   <button
                     type="button"
@@ -845,14 +861,14 @@ export default function InvoiceDetail() {
                   type="button"
                   className="button"
                   onClick={() => setShowPayModal(false)}
-                  disabled={submitting}
+                  disabled={submitting || !canWrite}
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
                   className="button button-primary"
-                  disabled={submitting}
+                  disabled={submitting || !canWrite}
                 >
                   {submitting ? "Saving…" : "Save payment"}
                 </button>
@@ -930,7 +946,7 @@ export default function InvoiceDetail() {
                             <td className="td-strong">{tx.description}</td>
                             <td>{tx.counterparty || "—"}</td>
                             <td className="mono" style={{ textAlign: "right", color: "#3d7150", fontWeight: 600 }}>
-                              {tx.currency} {Number(tx.available_amount).toLocaleString("en-DK", { minimumFractionDigits: 2 })}
+                              {tx.currency} {formatMoney(String(tx.available_amount))}
                             </td>
                           </tr>
                         );
@@ -964,7 +980,7 @@ export default function InvoiceDetail() {
                     type="button"
                     className="button"
                     onClick={() => setShowLinkModal(false)}
-                    disabled={submitting}
+                    disabled={submitting || !canWrite}
                   >
                     Cancel
                   </button>

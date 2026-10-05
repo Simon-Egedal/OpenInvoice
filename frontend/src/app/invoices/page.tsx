@@ -1,3 +1,21 @@
 "use client";
-import Link from "next/link";import { useEffect,useMemo,useState } from "react";import { Plus,Search,Upload } from "lucide-react";import { api,Invoice,Party } from "@/lib/api";import { InvoiceTable } from "@/components/data-table";
-export default function Invoices(){const [items,setItems]=useState<Invoice[]>([]);const [parties,setParties]=useState<Party[]>([]);const [q,setQ]=useState("");const [status,setStatus]=useState("all");useEffect(()=>{api<Invoice[]>('/invoices').then(setItems).catch(()=>{});api<Party[]>('/customers').then(setParties).catch(()=>{});api<Party[]>('/suppliers').then(rows=>setParties(current=>[...current,...rows])).catch(()=>{})},[]);const names=Object.fromEntries(parties.map(p=>[p.id,p.name]));const filtered=useMemo(()=>items.filter(i=>(status==="all"||i.status===status)&&`${i.invoice_number} ${names[i.customer_id??i.supplier_id??""]??""}`.toLowerCase().includes(q.toLowerCase())),[items,status,q,parties]);return <div className="page"><header className="page-head"><div><h1 className="page-title">Invoices</h1><p className="page-description">Create, send and track incoming and outgoing invoices.</p></div><div style={{display:"flex",gap:8}}><Link className="button" href="/invoices/receive"><Upload size={14}/>Receive PDF</Link><Link className="button button-primary" href="/invoices/new"><Plus size={15}/>New invoice</Link></div></header><div className="toolbar"><div style={{position:"relative",flex:1,maxWidth:330}}><Search size={14} style={{position:"absolute",left:10,top:10,color:"#858d87"}}/><input aria-label="Search invoices" className="search" style={{paddingLeft:31,width:"100%"}} placeholder="Search invoices…" value={q} onChange={e=>setQ(e.target.value)}/></div><select className="filter" aria-label="Filter by status" value={status} onChange={e=>setStatus(e.target.value)}><option value="all">All statuses</option>{["draft","received","pending_approval","approved","sent","partially_paid","paid","overdue","cancelled","rejected"].map(s=><option key={s} value={s}>{s.replaceAll("_"," ")}</option>)}</select></div><InvoiceTable items={filtered} partyNames={names}/></div>}
+import Link from "next/link";
+import { useState } from "react";
+import { Invoice } from "@/lib/api";
+import { InvoiceTable } from "@/components/data-table";
+import { Pagination } from "@/components/pagination";
+import { usePagedRecords } from "@/lib/use-paged-records";
+
+export default function Invoices() {
+  const [q, setQ] = useState("");
+  const [status, setStatus] = useState("all");
+  const [kind, setKind] = useState("all");
+  const records = usePagedRecords<Invoice>("/invoices", `&q=${encodeURIComponent(q)}${status === "all" ? "" : `&status=${status}`}${kind === "all" ? "" : `&invoice_type=${kind}`}`);
+  const names = Object.fromEntries(records.items.map(invoice => [invoice.customer_id ?? invoice.supplier_id ?? "", invoice.recipient_name ?? ""]));
+  return <div className="page"><header className="page-head"><div><h1 className="page-title">Invoices</h1><p className="page-description">Create, send and track incoming and outgoing invoices.</p></div><div className="row-actions"><Link className="button" href="/invoices/receive">Receive PDF</Link><Link className="button button-primary" href="/invoices/new">New invoice</Link></div></header>
+    <div className="toolbar"><input className="search" aria-label="Search invoices" placeholder="Search invoice number or party…" value={q} onChange={e => {setQ(e.target.value); records.setPage(0);}}/><select className="filter" aria-label="Invoice direction" value={kind} onChange={e => {setKind(e.target.value); records.setPage(0);}}><option value="all">Incoming and outgoing</option><option value="outgoing">Outgoing</option><option value="incoming">Incoming</option></select><select className="filter" aria-label="Filter by status" value={status} onChange={e => {setStatus(e.target.value); records.setPage(0);}}><option value="all">All statuses</option>{["draft", "issued", "received", "pending_approval", "approved", "sent", "partially_paid", "paid", "overdue", "cancelled", "rejected"].map(value => <option key={value} value={value}>{value.replaceAll("_", " ")}</option>)}</select></div>
+    {records.error && <p className="error-text" role="alert">{records.error} <button className="button" onClick={() => records.load()}>Retry</button></p>}
+    {records.loading && <p role="status">Loading invoices…</p>}
+    <InvoiceTable items={records.items} partyNames={names}/><Pagination page={records.page} count={records.items.length} busy={records.loading} onPage={records.setPage}/>
+  </div>;
+}

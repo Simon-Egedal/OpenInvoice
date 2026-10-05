@@ -1,4 +1,5 @@
 "use client";
+import { formatMoney, scaled } from "@/lib/money";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState, useRef } from "react";
@@ -48,7 +49,7 @@ function CallbackContent() {
       try {
         const result = await api<CallbackResult>("/banking/connections/callback", {
           method: "POST",
-          body: JSON.stringify({ code }),
+          body: JSON.stringify({ code, state: searchParams.get("state") ?? "" }),
         });
         setStatus("success");
         setAccounts(result.accounts || []);
@@ -123,7 +124,7 @@ function CallbackContent() {
                   </div>
                 </div>
                 <div style={{ textAlign: "right", fontFamily: "monospace" }}>
-                  {a.currency} {Number(a.balance).toLocaleString("en-DK", { minimumFractionDigits: 2 })}
+                  {a.currency} {formatMoney(String(a.balance))}
                 </div>
               </div>
             ))}

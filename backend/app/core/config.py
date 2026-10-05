@@ -35,5 +35,6 @@ if not settings.database_url:
 
 from app.core.runtime_config import apply_saved_settings, get_or_create_secret
 
-settings.secret_key = settings.secret_key or get_or_create_secret()
+encryption_secret = get_or_create_secret()
+settings.secret_key = settings.secret_key or encryption_secret
 apply_saved_settings(settings)

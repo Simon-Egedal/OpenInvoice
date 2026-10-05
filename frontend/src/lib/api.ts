@@ -1,7 +1,7 @@
 export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API}/api/v1${path}`, { ...init, credentials: "include", headers: { "Content-Type": "application/json", ...init.headers } });
-  if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.detail ?? `Request failed (${response.status})`); }
+  if (!response.ok) { const body = await response.json().catch(() => ({})); const detail = body.detail; throw new Error(typeof detail === "string" ? detail : Array.isArray(detail) ? detail.map((error: {loc?: string[]; msg?: string}) => `${error.loc?.join(".") ?? "Input"}: ${error.msg ?? "Invalid value"}`).join("; ") : `Request failed (${response.status})`); }
   if (response.status === 204) return undefined as T;
   return response.json();
 }
@@ -33,6 +33,8 @@ export type Invoice = {
   paid_amount: string;
   due_amount: string;
   notes: string | null;
+  issued_at?: string | null;
+  is_overdue?: boolean;
 };
 
 export type InvoicePayment = {
@@ -99,7 +101,7 @@ export type BankTransactionItem = {
 
 export type Party = { id:string; name:string; email:string|null; phone:string|null; address:string|null; postal_code:string|null; city:string|null; country:string; vat_number:string|null; payment_information:string|null; notes:string|null };
 export type Product = { id: string; name: string; unit_price: string };
-export type CurrentUser = { id: string; email: string; full_name: string; role: "owner" | "admin" | "member" | "accountant" | "approver" | "viewer" };
+export type CurrentUser = { is_active?: boolean; membership_active?: boolean; invitation_pending?: boolean; id: string; email: string; full_name: string; role: "owner" | "admin" | "member" | "accountant" | "approver" | "viewer" };
 export type SetupStatus = {
   complete: boolean;
   applied: boolean;
@@ -116,6 +118,13 @@ export type Organization = {
   currency: string;
   logo_key?: string | null;
   logo_url?: string | null;
+  address?: string | null;
+  postal_code?: string | null;
+  city?: string | null;
+  vat_number?: string | null;
+  payment_information?: string | null;
+  payment_terms?: string | null;
+  invoice_prefix?: string;
 };
 export type InfrastructureConfig = {
   can_manage: boolean;

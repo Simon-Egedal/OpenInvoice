@@ -15,10 +15,13 @@ async def current_user(request: Request, db: AsyncSession=Depends(get_db))->User
     if not raw: raise HTTPException(401,"Authentication required")
     user=await db.get(User,UUID(raw))
     if not user or not user.is_active: raise HTTPException(401,"Authentication required")
+    if request.session.get("session_version", 0) != (user.session_version or 0):
+        request.session.clear()
+        raise HTTPException(401, "Session revoked; sign in again")
     return user
 
 async def current_membership(user: User=Depends(current_user), db: AsyncSession=Depends(get_db), x_organization_id: str|None=Header(default=None))->OrganizationMember:
-    query=select(OrganizationMember).where(OrganizationMember.user_id==user.id)
+    query=select(OrganizationMember).where(OrganizationMember.user_id==user.id, OrganizationMember.is_active == True)
     if x_organization_id:
         try: org_id=UUID(x_organization_id)
         except ValueError: raise HTTPException(400,"Invalid organization ID")

@@ -13,7 +13,7 @@ export default function AuthPage() {
   useEffect(() => {
     api<SetupStatus>("/setup/status")
       .then((status) => setOrganizationName(status.organization_name || ""))
-      .catch(() => {});
+      .catch(e => setError(e instanceof Error ? e.message : "Unable to load installation status"));
   }, []);
 
   async function submit(e: React.FormEvent<HTMLFormElement>) {
@@ -68,6 +68,7 @@ export default function AuthPage() {
           {busy ? "Please wait…" : "Sign in"}
         </button>
       </form>
+      <Link className="text-link" href="/auth/recover">Forgot password?</Link>
     </div>
   );
 }

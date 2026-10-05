@@ -1,10 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useId, cloneElement, isValidElement, ReactElement } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Plus, Trash2 } from "lucide-react";
-import { api, Organization, Party, Product } from "@/lib/api";
+import { api, Organization, Product } from "@/lib/api";
+import { PartySelect } from "@/components/party-select";
+
+import { invoiceTotals, lineAmount, formatMoney } from "@/lib/money";
 
 type Line = {
   description: string;
@@ -15,7 +18,6 @@ type Line = {
 
 export default function NewInvoice() {
   const router = useRouter();
-  const [customers, setCustomers] = useState<Party[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [currency, setCurrency] = useState("DKK");
   const [lines, setLines] = useState<Line[]>([
@@ -26,30 +28,17 @@ export default function NewInvoice() {
   const today = new Date().toISOString().slice(0, 10);
 
   useEffect(() => {
-    api<Party[]>("/customers").then(setCustomers).catch(() => {});
-    api<Product[]>("/products").then(setProducts).catch(() => {});
+    api<Product[]>("/products").then(setProducts).catch(e => setError(e instanceof Error ? e.message : "Unable to load invoice options"));
     api<Organization[]>("/organizations")
       .then((orgs) => {
         if (orgs && orgs.length > 0 && orgs[0].currency) {
           setCurrency(orgs[0].currency);
         }
       })
-      .catch(() => {});
+      .catch(e => setError(e instanceof Error ? e.message : "Unable to load invoice options"));
   }, []);
 
-  const subtotal = lines.reduce(
-    (n, l) => n + (Number(l.quantity) || 0) * (Number(l.unit_price) || 0),
-    0
-  );
-  const tax = lines.reduce(
-    (n, l) =>
-      n +
-      ((Number(l.quantity) || 0) *
-        (Number(l.unit_price) || 0) *
-        (Number(l.tax_rate) || 0)) /
-        100,
-    0
-  );
+  const {subtotal, tax, total} = invoiceTotals(lines);
 
   async function save(e: React.FormEvent) {
     e.preventDefault();
@@ -69,9 +58,9 @@ export default function NewInvoice() {
           notes: form.get("notes") || null,
           lines: lines.map((l) => ({
             ...l,
-            quantity: Number(l.quantity),
-            unit_price: Number(l.unit_price),
-            tax_rate: Number(l.tax_rate),
+            quantity: l.quantity,
+            unit_price: l.unit_price,
+            tax_rate: l.tax_rate,
           })),
         }),
       });
@@ -108,23 +97,12 @@ export default function NewInvoice() {
       <form onSubmit={save}>
         <div className="section-heading">Invoice details</div>
         <div className="form-grid" style={{ maxWidth: 800, marginBottom: 28 }}>
-          <Field label="Customer">
-            <select required name="customer_id" defaultValue="">
-              <option value="" disabled>
-                Select a customer
-              </option>
-              {customers.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
-          </Field>
+          <PartySelect kind="customers" name="customer_id" label="Customer"/>
           <Field label="Invoice number">
             <input
               name="invoice_number"
-              required
-              defaultValue={`INV-${new Date().getFullYear()}-${String(Date.now()).slice(-4)}`}
+              placeholder="Assigned automatically"
+              defaultValue=""
             />
           </Field>
           <Field label="Issue date">
@@ -144,7 +122,7 @@ export default function NewInvoice() {
               required
               value={currency}
               onChange={(e) => setCurrency(e.target.value.toUpperCase())}
-              maxLength={10}
+              maxLength={3}
             />
           </Field>
         </div>
@@ -201,7 +179,7 @@ export default function NewInvoice() {
                           <option value="">Choose saved product…</option>
                           {products.map((product) => (
                             <option key={product.id} value={product.id}>
-                              {product.name} · {currency} {Number(product.unit_price).toFixed(2)}
+                              {product.name} · {currency} {formatMoney(product.unit_price)}
                             </option>
                           ))}
                         </select>
@@ -257,7 +235,7 @@ export default function NewInvoice() {
                     />
                   </td>
                   <td className="mono" style={{ textAlign: "right" }}>
-                    {((Number(l.quantity) || 0) * (Number(l.unit_price) || 0)).toFixed(2)}
+                    {lineAmount(l)}
                   </td>
                   <td>
                     <button
@@ -279,19 +257,19 @@ export default function NewInvoice() {
           <div className="invoice-total-row">
             <span>Subtotal</span>
             <span className="mono">
-              {currency} {subtotal.toFixed(2)}
+              {currency} {subtotal}
             </span>
           </div>
           <div className="invoice-total-row">
             <span>VAT</span>
             <span className="mono">
-              {currency} {tax.toFixed(2)}
+              {currency} {tax}
             </span>
           </div>
           <div className="invoice-total-row final">
             <span>Total</span>
             <span className="mono">
-              {currency} {(subtotal + tax).toFixed(2)}
+              {currency} {total}
             </span>
           </div>
         </div>
@@ -328,10 +306,11 @@ export default function NewInvoice() {
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  const id = useId();
   return (
     <div className="field">
-      <label>{label}</label>
-      {children}
+      <label htmlFor={id}>{label}</label>
+      {isValidElement(children) ? cloneElement(children as ReactElement<{id?: string}>, {id}) : children}
     </div>
   );
 }

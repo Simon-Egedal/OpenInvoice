@@ -2,21 +2,20 @@ from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 from uuid import UUID
-import secrets
-import logging
 from fastapi import HTTPException
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, delete
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import hash_password, verify_password
-from app.providers.email import EmailProvider
 from app.core.runtime_config import settings_are_applied
 from app.models.entities import (
     AuditLog,
     BankAccount,
     BankTransaction,
+    Customer,
+    Supplier,
     Invoice,
+    EmailDelivery,
     InvoiceLine,
     InvoicePayment,
     InvoiceStatus,
@@ -31,34 +30,6 @@ from app.providers.storage import storage_provider
 
 CENT=Decimal("0.01")
 
-async def create_member_account(db: AsyncSession, payload, membership, actor: User, provider: EmailProvider):
-    email = str(payload.email).lower()
-    if await db.scalar(select(User).where(func.lower(User.email) == email)):
-        raise HTTPException(409, "An account with this email already exists")
-    organization = await db.scalar(select(Organization).where(Organization.id == membership.organization_id))
-    if not organization:
-        raise HTTPException(404, "Organization not found")
-    password = secrets.token_urlsafe(24)
-    user = User(email=email, full_name=email.split("@", 1)[0][:200], password_hash=hash_password(password))
-    try:
-        db.add(user)
-        await db.flush()
-        db.add(OrganizationMember(organization_id=membership.organization_id, user_id=user.id, role=payload.role))
-        db.add(AuditLog(organization_id=membership.organization_id, user_id=actor.id,
-                        action="account.created", entity_type="user", entity_id=user.id,
-                        new_values={"email": email, "role": payload.role}))
-        await db.flush()
-        await provider.send_account_credentials(email, password, payload.role, organization.name)
-        await db.commit()
-    except IntegrityError:
-        await db.rollback()
-        raise HTTPException(409, "An account with this email already exists") from None
-    except Exception:
-        await db.rollback()
-        logging.getLogger(__name__).warning("Account creation or credentials email delivery failed")
-        raise HTTPException(502, "Unable to create account and send credentials. Check SMTP configuration and try again.") from None
-    return {"id": user.id, "email": user.email, "full_name": user.full_name, "role": payload.role}
-
 async def update_user_profile(db: AsyncSession, user: User, full_name: str):
     user.full_name = full_name
     await db.commit()
@@ -66,24 +37,97 @@ async def update_user_profile(db: AsyncSession, user: User, full_name: str):
     return user
 
 async def change_user_password(db: AsyncSession, user: User, current_password: str, new_password: str):
+    await db.refresh(user, with_for_update=True)
     if not verify_password(current_password, user.password_hash):
         raise HTTPException(400, "Current password is incorrect")
     user.password_hash = hash_password(new_password)
+    user.session_version = (user.session_version or 0) + 1
     await db.commit()
 
 def money(value: Decimal)->Decimal: return value.quantize(CENT,rounding=ROUND_HALF_UP)
 
 async def create_invoice(db: AsyncSession, data, organization_id, user_id)->Invoice:
+    org = await db.scalar(select(Organization).where(Organization.id == organization_id).with_for_update(key_share=True))
+    if not org:
+        raise HTTPException(404, "Organization not found")
+    party_model = Customer if data.invoice_type == InvoiceType.outgoing else Supplier
+    party_id = data.customer_id if data.invoice_type == InvoiceType.outgoing else data.supplier_id
+    if not party_id or not await db.scalar(select(party_model.id).where(party_model.id == party_id, party_model.organization_id == organization_id)):
+        raise HTTPException(422, "Choose a party from this organization")
+    number = await reserve_invoice_number(db, org, data.invoice_type, data.supplier_id, data.invoice_number)
     subtotal=Decimal("0"); tax=Decimal("0"); prepared=[]
     for line in data.lines:
         amount=money(line.quantity*line.unit_price)
         line_tax=money(amount*line.tax_rate/Decimal("100"))
         subtotal+=amount; tax+=line_tax; prepared.append((line,amount))
-    invoice=Invoice(organization_id=organization_id,created_by=user_id,invoice_number=data.invoice_number,invoice_type=data.invoice_type,status="draft",customer_id=data.customer_id,supplier_id=data.supplier_id,issue_date=data.issue_date,due_date=data.due_date,currency=data.currency.upper(),subtotal=money(subtotal),tax_amount=money(tax),total=money(subtotal+tax),notes=data.notes)
+    if subtotal + tax >= Decimal("1000000000000"):
+        raise HTTPException(422, "Invoice total exceeds supported amount")
+    invoice=Invoice(organization_id=organization_id,created_by=user_id,invoice_number=number,invoice_type=data.invoice_type,status="draft",customer_id=data.customer_id,supplier_id=data.supplier_id,issue_date=data.issue_date,due_date=data.due_date,currency=data.currency.upper(),subtotal=money(subtotal),tax_amount=money(tax),total=money(subtotal+tax),notes=data.notes)
     db.add(invoice); await db.flush()
-    for line,amount in prepared: db.add(InvoiceLine(invoice_id=invoice.id,description=line.description,quantity=line.quantity,unit_price=line.unit_price,tax_rate=line.tax_rate,line_total=amount))
+    for position,(line,amount) in enumerate(prepared): db.add(InvoiceLine(organization_id=organization_id,invoice_id=invoice.id,description=line.description,quantity=line.quantity,unit_price=line.unit_price,tax_rate=line.tax_rate,line_total=amount,position=position))
     db.add(AuditLog(organization_id=organization_id,user_id=user_id,action="invoice.created",entity_type="invoice",entity_id=invoice.id,new_values={"invoice_number":invoice.invoice_number,"total":str(invoice.total)}))
     await db.commit(); await db.refresh(invoice)
+    return invoice
+
+
+async def reserve_invoice_number(db: AsyncSession, org: Organization, invoice_type: InvoiceType, supplier_id: UUID | None, number: str, exclude_id: UUID | None = None) -> str:
+    """Called while holding the organization lock; database indexes enforce uniqueness."""
+    async def exists(candidate):
+        query = select(Invoice.id).where(Invoice.organization_id == org.id, Invoice.invoice_type == invoice_type, Invoice.invoice_number == candidate)
+        if invoice_type == InvoiceType.incoming:
+            query = query.where(Invoice.supplier_id == supplier_id)
+        if exclude_id:
+            query = query.where(Invoice.id != exclude_id)
+        return await db.scalar(query)
+    if number.strip():
+        number = number.strip()
+        if await exists(number):
+            raise HTTPException(409, "An invoice with this number already exists")
+        return number
+    if invoice_type != InvoiceType.outgoing:
+        raise HTTPException(422, "Supplier invoice number is required")
+    while True:
+        number = f"{org.invoice_prefix}-{org.next_invoice_number:06d}"
+        org.next_invoice_number += 1
+        if not await exists(number):
+            return number
+
+
+async def update_invoice_draft(db, payload, organization_id, user_id, invoice_id):
+    org = await db.scalar(select(Organization).where(Organization.id == organization_id).with_for_update(key_share=True))
+    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id, Invoice.organization_id == organization_id).with_for_update())
+    if not invoice:
+        raise HTTPException(404, "Invoice not found")
+    if invoice.status != InvoiceStatus.draft:
+        raise HTTPException(409, "Only draft invoices can be edited")
+    if payload.invoice_type != invoice.invoice_type:
+        raise HTTPException(422, "Invoice type cannot be changed")
+    model = Customer if payload.invoice_type == InvoiceType.outgoing else Supplier
+    party_id = payload.customer_id if payload.invoice_type == InvoiceType.outgoing else payload.supplier_id
+    if not party_id or not await db.scalar(select(model.id).where(model.id == party_id, model.organization_id == organization_id)):
+        raise HTTPException(422, "Choose a party from this organization")
+    if payload.invoice_number != invoice.invoice_number or payload.supplier_id != invoice.supplier_id:
+        payload.invoice_number = await reserve_invoice_number(db, org, payload.invoice_type, payload.supplier_id, payload.invoice_number, exclude_id=invoice.id)
+    subtotal = Decimal("0.00")
+    tax = Decimal("0.00")
+    prepared = []
+    for line in payload.lines:
+        amount = money(line.quantity * line.unit_price)
+        subtotal += amount
+        tax += money(amount * line.tax_rate / Decimal("100"))
+        prepared.append((line, amount))
+    if subtotal + tax >= Decimal("1000000000000"):
+        raise HTTPException(422, "Invoice total exceeds supported amount")
+    old_values = {"invoice_number": invoice.invoice_number, "total": str(invoice.total)}
+    for name in ("invoice_number", "invoice_type", "customer_id", "supplier_id", "issue_date", "due_date", "currency", "notes"):
+        setattr(invoice, name, getattr(payload, name))
+    invoice.subtotal, invoice.tax_amount, invoice.total = money(subtotal), money(tax), money(subtotal + tax)
+    await db.execute(delete(InvoiceLine).where(InvoiceLine.invoice_id == invoice.id, InvoiceLine.organization_id == organization_id))
+    for position, (line, amount) in enumerate(prepared):
+        db.add(InvoiceLine(organization_id=organization_id, invoice_id=invoice.id, position=position, description=line.description, quantity=line.quantity, unit_price=line.unit_price, tax_rate=line.tax_rate, line_total=amount))
+    db.add(AuditLog(organization_id=organization_id, user_id=user_id, action="invoice.updated", entity_type="invoice", entity_id=invoice.id, old_values=old_values, new_values={"invoice_number": invoice.invoice_number, "total": str(invoice.total)}))
+    await db.commit()
+    await db.refresh(invoice)
     return invoice
 
 async def create_initial_organization(
@@ -261,19 +305,25 @@ def prepare_infrastructure_update(
     return values, url
 
 
-async def recalculate_invoice_payment(db: AsyncSession, invoice_id: UUID) -> Invoice:
-    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id))
+async def lock_financial_records(db: AsyncSession, organization_id: UUID):
+    """Serialize allocations per tenant, including unlink and manual payment operations."""
+    await db.scalar(select(Organization.id).where(Organization.id == organization_id).with_for_update(key_share=True))
+
+
+async def recalculate_invoice_payment(db: AsyncSession, invoice_id: UUID, organization_id: UUID) -> Invoice:
+    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id, Invoice.organization_id == organization_id).with_for_update())
     if not invoice:
         raise ValueError("Invoice not found")
 
     manual_sum_val = await db.scalar(
-        select(func.coalesce(func.sum(InvoicePayment.amount), 0)).where(InvoicePayment.invoice_id == invoice_id)
+        select(func.coalesce(func.sum(InvoicePayment.amount), 0)).where(InvoicePayment.invoice_id == invoice_id, InvoicePayment.organization_id == organization_id)
     )
     manual_sum = Decimal(str(manual_sum_val or 0))
 
     matched_sum_val = await db.scalar(
         select(func.coalesce(func.sum(InvoiceTransactionMatch.amount), 0)).where(
             InvoiceTransactionMatch.invoice_id == invoice_id,
+            InvoiceTransactionMatch.organization_id == organization_id,
             InvoiceTransactionMatch.confirmed == True,
         )
     )
@@ -288,7 +338,11 @@ async def recalculate_invoice_payment(db: AsyncSession, invoice_id: UUID) -> Inv
         invoice.status = InvoiceStatus.partially_paid
     elif total_paid == Decimal("0.00"):
         if invoice.status in (InvoiceStatus.paid, InvoiceStatus.partially_paid):
-            invoice.status = InvoiceStatus.sent if invoice.invoice_type == InvoiceType.outgoing else InvoiceStatus.received
+            if invoice.invoice_type == InvoiceType.outgoing:
+                delivered = await db.scalar(select(EmailDelivery.id).where(EmailDelivery.invoice_id == invoice_id, EmailDelivery.organization_id == organization_id, EmailDelivery.kind == "invoice", EmailDelivery.status == "sent").limit(1)) if invoice.issued_at else True
+                invoice.status = InvoiceStatus.sent if delivered else InvoiceStatus.issued
+            else:
+                invoice.status = InvoiceStatus.approved
 
     await db.flush()
     return invoice
@@ -305,11 +359,17 @@ async def record_manual_payment(
     reference: str | None = None,
     notes: str | None = None,
 ) -> InvoicePayment:
+    await lock_financial_records(db, organization_id)
     invoice = await db.scalar(
-        select(Invoice).where(Invoice.id == invoice_id, Invoice.organization_id == organization_id)
+        select(Invoice).where(Invoice.id == invoice_id, Invoice.organization_id == organization_id).with_for_update()
     )
     if not invoice:
         raise ValueError("Invoice not found")
+
+    if invoice.status in {InvoiceStatus.draft, InvoiceStatus.pending_approval, InvoiceStatus.rejected, InvoiceStatus.cancelled}:
+        raise ValueError("Issue or approve the invoice before recording payment")
+    if invoice.invoice_type == InvoiceType.incoming and invoice.status == InvoiceStatus.received:
+        raise ValueError("Approve the supplier invoice before recording payment")
 
     remaining_due = invoice.due_amount
     if amount is None:
@@ -319,6 +379,8 @@ async def record_manual_payment(
 
     if amount_to_pay <= Decimal("0.00"):
         raise ValueError("Payment amount must be greater than zero")
+    if amount_to_pay > remaining_due:
+        raise ValueError("Payment amount exceeds the remaining invoice balance")
 
     effective_date = payment_date or datetime.now(timezone.utc).date()
 
@@ -334,7 +396,7 @@ async def record_manual_payment(
     db.add(payment)
     await db.flush()
 
-    await recalculate_invoice_payment(db, invoice.id)
+    await recalculate_invoice_payment(db, invoice.id, organization_id)
 
     db.add(
         AuditLog(
@@ -361,14 +423,16 @@ async def delete_manual_payment(
     organization_id: UUID,
     user_id: UUID,
     payment_id: UUID,
+    expected_invoice_id: UUID | None = None,
 ) -> Invoice:
+    await lock_financial_records(db, organization_id)
     payment = await db.scalar(
         select(InvoicePayment).where(
             InvoicePayment.id == payment_id,
             InvoicePayment.organization_id == organization_id,
         )
     )
-    if not payment:
+    if not payment or (expected_invoice_id is not None and payment.invoice_id != expected_invoice_id):
         raise ValueError("Payment not found")
 
     invoice_id = payment.invoice_id
@@ -376,7 +440,7 @@ async def delete_manual_payment(
     await db.delete(payment)
     await db.flush()
 
-    invoice = await recalculate_invoice_payment(db, invoice_id)
+    invoice = await recalculate_invoice_payment(db, invoice_id, organization_id)
 
     db.add(
         AuditLog(
@@ -401,8 +465,9 @@ async def link_invoice_to_transaction(
     transaction_id: UUID,
     amount: Decimal | None = None,
 ) -> InvoiceTransactionMatch:
+    await lock_financial_records(db, organization_id)
     invoice = await db.scalar(
-        select(Invoice).where(Invoice.id == invoice_id, Invoice.organization_id == organization_id)
+        select(Invoice).where(Invoice.id == invoice_id, Invoice.organization_id == organization_id).with_for_update()
     )
     if not invoice:
         raise ValueError("Invoice not found")
@@ -416,6 +481,13 @@ async def link_invoice_to_transaction(
     if not transaction:
         raise ValueError("Bank transaction not found")
 
+    if transaction.currency != invoice.currency:
+        raise ValueError("Bank transaction and invoice currencies must match")
+    if invoice.status in {InvoiceStatus.draft, InvoiceStatus.pending_approval, InvoiceStatus.rejected, InvoiceStatus.cancelled}:
+        raise ValueError("Issue or approve the invoice before matching payment")
+    if invoice.invoice_type == InvoiceType.incoming and invoice.status == InvoiceStatus.received:
+        raise ValueError("Approve the supplier invoice before matching payment")
+
     expected_invoice_type = InvoiceType.outgoing if transaction.direction == "credit" else InvoiceType.incoming
     if invoice.invoice_type != expected_invoice_type:
         direction_label = "credit" if transaction.direction == "credit" else "debit"
@@ -428,6 +500,7 @@ async def link_invoice_to_transaction(
         select(InvoiceTransactionMatch).where(
             InvoiceTransactionMatch.invoice_id == invoice_id,
             InvoiceTransactionMatch.transaction_id == transaction_id,
+            InvoiceTransactionMatch.organization_id == organization_id,
             InvoiceTransactionMatch.organization_id == organization_id,
         )
     )
@@ -458,6 +531,8 @@ async def link_invoice_to_transaction(
             raise ValueError(
                 f"Specified amount ({allocated}) exceeds available unallocated transaction amount ({available_on_tx})"
             )
+        if allocated > effective_due:
+            raise ValueError("Allocated amount exceeds the remaining invoice balance")
 
     if allocated <= Decimal("0.00"):
         raise ValueError("No remaining balance on the invoice to link")
@@ -479,7 +554,7 @@ async def link_invoice_to_transaction(
         db.add(match_obj)
 
     await db.flush()
-    await recalculate_invoice_payment(db, invoice.id)
+    await recalculate_invoice_payment(db, invoice.id, organization_id)
 
     db.add(
         AuditLog(
@@ -506,14 +581,16 @@ async def unlink_invoice_transaction(
     organization_id: UUID,
     user_id: UUID,
     match_id: UUID,
+    expected_invoice_id: UUID | None = None,
 ) -> Invoice:
+    await lock_financial_records(db, organization_id)
     match_obj = await db.scalar(
         select(InvoiceTransactionMatch).where(
             InvoiceTransactionMatch.id == match_id,
             InvoiceTransactionMatch.organization_id == organization_id,
         )
     )
-    if not match_obj:
+    if not match_obj or (expected_invoice_id is not None and match_obj.invoice_id != expected_invoice_id):
         raise ValueError("Transaction match not found")
 
     invoice_id = match_obj.invoice_id
@@ -523,7 +600,7 @@ async def unlink_invoice_transaction(
     await db.delete(match_obj)
     await db.flush()
 
-    invoice = await recalculate_invoice_payment(db, invoice_id)
+    invoice = await recalculate_invoice_payment(db, invoice_id, organization_id)
 
     db.add(
         AuditLog(
@@ -542,5 +619,3 @@ async def unlink_invoice_transaction(
     await db.commit()
     await db.refresh(invoice)
     return invoice
-
-

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { formatMoney, scaled } from "@/lib/money";
 import { Invoice, Party } from "@/lib/api";
 export function InvoiceTable({items,partyNames={}}:{items:Invoice[];partyNames?:Record<string,string>}) {
   if(!items.length)return <div className="empty">No invoices yet. Create an invoice to get started.</div>;
@@ -23,10 +24,10 @@ export function InvoiceTable({items,partyNames={}}:{items:Invoice[];partyNames?:
               <td>{i.issue_date}</td>
               <td>{i.due_date}</td>
               <td className="mono" style={{textAlign:"right"}}>
-                <div>{i.currency} {Number(i.total).toLocaleString("en-DK",{minimumFractionDigits:2})}</div>
-                {Number(i.paid_amount ?? 0) > 0 && Number(i.due_amount ?? 0) > 0 && (
+                <div>{i.currency} {formatMoney(String(i.total))}</div>
+                {scaled(String(i.paid_amount ?? 0)) > 0n && scaled(String(i.due_amount ?? 0)) > 0n && (
                   <div style={{fontSize:10,color:"#a05e24"}}>
-                    Due: {i.currency} {Number(i.due_amount).toLocaleString("en-DK",{minimumFractionDigits:2})}
+                    Due: {i.currency} {formatMoney(String(i.due_amount))}
                   </div>
                 )}
                 {i.status === "paid" && (
@@ -35,7 +36,7 @@ export function InvoiceTable({items,partyNames={}}:{items:Invoice[];partyNames?:
                   </div>
                 )}
               </td>
-              <td><span className={`status ${i.status}`}>{i.status.replaceAll("_"," ")}</span></td>
+              <td><span className={`status ${i.status}`}>{i.is_overdue ? "overdue" : i.status.replaceAll("_"," ")}</span></td>
             </tr>
           ))}
         </tbody>

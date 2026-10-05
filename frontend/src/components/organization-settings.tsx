@@ -15,6 +15,7 @@ export function OrganizationSettings() {
   const [orgName, setOrgName] = useState("");
   const [orgCountry, setOrgCountry] = useState("DK");
   const [orgCurrency, setOrgCurrency] = useState("DKK");
+  const [billing, setBilling] = useState({address: "", postal_code: "", city: "", vat_number: "", payment_information: "", payment_terms: "", invoice_prefix: "INV"});
   const [customCurrency, setCustomCurrency] = useState("");
   const [logoPreview, setLogoPreview] = useState<string | null>(null);
   const [logoFile, setLogoFile] = useState<File | null>(null);
@@ -24,7 +25,7 @@ export function OrganizationSettings() {
   const [orgSuccess, setOrgSuccess] = useState("");
 
   useEffect(() => {
-    api<CurrentUser>("/auth/me").then(user => setIsAdmin(["owner", "admin"].includes(user.role))).catch(() => {});
+    api<CurrentUser>("/auth/me").then(user => setIsAdmin(["owner", "admin"].includes(user.role))).catch(e => setOrgError(e instanceof Error ? e.message : "Unable to check organization permissions"));
   }, []);
 
   // Load Organization
@@ -34,6 +35,7 @@ export function OrganizationSettings() {
         setOrg(data);
         setOrgName(data.name);
         setOrgCountry(data.country);
+        setBilling({address: data.address ?? "", postal_code: data.postal_code ?? "", city: data.city ?? "", vat_number: data.vat_number ?? "", payment_information: data.payment_information ?? "", payment_terms: data.payment_terms ?? "", invoice_prefix: data.invoice_prefix ?? "INV"});
         const curr = data.currency || "DKK";
         if (CURRENCIES.includes(curr)) {
           setOrgCurrency(curr);
@@ -46,7 +48,7 @@ export function OrganizationSettings() {
           setLogoPreview(`${API}/api/v1/organizations/${data.id}/logo`);
         }
       })
-      .catch(() => {})
+      .catch(e => setOrgError(e instanceof Error ? e.message : "Unable to load organization"))
       .finally(() => {
         setLoadingOrg(false);
       });
@@ -73,6 +75,7 @@ export function OrganizationSettings() {
           name: orgName.trim(),
           country: orgCountry.trim().toUpperCase(),
           currency: finalCurrency,
+          ...billing,
         }),
       });
 
@@ -198,6 +201,12 @@ export function OrganizationSettings() {
                   />
                 </Field>
               </div>
+
+              <div className="setup-grid">
+                {([ ["address", "Seller address"], ["postal_code", "Postal code"], ["city", "City"], ["vat_number", "VAT number"], ["invoice_prefix", "Invoice number prefix"] ] as const).map(([key, label]) => <Field key={key} label={label}><input value={billing[key]} disabled={!isAdmin} maxLength={key === "invoice_prefix" ? 20 : key === "address" ? 300 : key === "postal_code" ? 30 : key === "city" ? 100 : 80} required={key === "invoice_prefix"} pattern={key === "invoice_prefix" ? "[A-Za-z0-9-]{1,20}" : undefined} onChange={e => setBilling(current => ({...current, [key]: e.target.value}))}/></Field>)}
+              </div>
+              <Field label="Bank and payment information"><textarea value={billing.payment_information} disabled={!isAdmin} maxLength={2000} onChange={e => setBilling(current => ({...current, payment_information: e.target.value}))}/></Field>
+              <Field label="Payment terms"><textarea value={billing.payment_terms} disabled={!isAdmin} maxLength={2000} onChange={e => setBilling(current => ({...current, payment_terms: e.target.value}))}/></Field>
 
               {/* Logo section */}
               <div className="field">

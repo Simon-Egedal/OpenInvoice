@@ -11,3 +11,6 @@ storage/
 temp.txt
 secrets/
 *.pem
+frontend/test-results/
+frontend/playwright-report/
+backups/

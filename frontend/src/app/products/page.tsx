@@ -1,11 +1,16 @@
 "use client";
+import { formatMoney, scaled } from "@/lib/money";
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { api, Organization, Product } from "@/lib/api";
 
+import { Pagination } from "@/components/pagination";
+
 export default function Products() {
+  const [page, setPage] = useState(0);
+  const [loading, setLoading] = useState(false);
   const [items, setItems] = useState<Product[]>([]);
   const [currency, setCurrency] = useState("DKK");
   const [name, setName] = useState("");
@@ -14,19 +19,20 @@ export default function Products() {
   const [error, setError] = useState("");
 
   async function load() {
+    setLoading(true); setError("");
     try {
       const [products, orgs] = await Promise.all([
-        api<Product[]>("/products"),
+        api<Product[]>(`/products?limit=50&offset=${page*50}`),
         api<Organization[]>("/organizations"),
       ]);
       setItems(products);
       if (orgs[0]?.currency) setCurrency(orgs[0].currency);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not load products");
-    }
+    } finally { setLoading(false); }
   }
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => { void load(); }, [page]);
 
   async function createProduct(e: React.FormEvent) {
     e.preventDefault();
@@ -37,7 +43,7 @@ export default function Products() {
         method: "POST",
         body: JSON.stringify({ name, unit_price: unitPrice.replace(",", ".") }),
       });
-      setItems((current) => [...current, item].sort((a, b) => a.name.localeCompare(b.name)));
+      await load();
       setName("");
       setUnitPrice("");
     } catch (e) {
@@ -50,7 +56,7 @@ export default function Products() {
   async function removeProduct(item: Product) {
     try {
       await api<void>(`/products/${item.id}`, { method: "DELETE" });
-      setItems((current) => current.filter((product) => product.id !== item.id));
+      await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not delete product");
     }
@@ -76,11 +82,11 @@ export default function Products() {
           <input id="product-price" type="number" min="0" step="0.01" value={unitPrice} onChange={(e) => setUnitPrice(e.target.value)} required />
         </div>
         <div className="field full" style={{ display: "flex", justifyContent: "flex-end" }}>
-          <button className="button button-primary" disabled={saving}><Plus size={14} />{saving ? "Saving…" : "Add product"}</button>
+          <button className="button button-primary" disabled={saving}><Plus size={14} />{saving ? "Savingâ€¦" : "Add product"}</button>
         </div>
       </form>
 
-      {error && <p className="error-text" role="alert">{error}</p>}
+      <Pagination page={page} count={items.length} busy={loading} onPage={setPage}/>{loading && <p role="status">Loading products…</p>}{error && <p className="error-text" role="alert">{error} <button className="button" onClick={load}>Retry</button></p>}
       <div className="table-wrap">
         <table>
           <thead><tr><th>Product or service</th><th style={{ textAlign: "right" }}>Unit price</th><th style={{ width: 48 }} /></tr></thead>
@@ -90,7 +96,7 @@ export default function Products() {
             ) : items.map((item) => (
               <tr key={item.id}>
                 <td className="td-strong">{item.name}</td>
-                <td className="mono" style={{ textAlign: "right" }}>{currency} {Number(item.unit_price).toLocaleString("en-DK", { minimumFractionDigits: 2 })}</td>
+                <td className="mono" style={{ textAlign: "right" }}>{currency} {formatMoney(String(item.unit_price))}</td>
                 <td><button className="icon-button" aria-label={`Delete ${item.name}`} title="Delete product" onClick={() => void removeProduct(item)}><Trash2 size={14} /></button></td>
               </tr>
             ))}

@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Generic, TypeVar
 from uuid import UUID
 from typing import Literal
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from app.models.entities import InvoiceStatus, InvoiceType, MemberRole
 
 class ORMModel(BaseModel): model_config=ConfigDict(from_attributes=True)
@@ -74,10 +74,13 @@ class CurrentUserOut(UserOut):
 
 class AccountCreateIn(BaseModel):
     email: EmailStr
-    role: Literal["member", "admin"]
+    role: Literal["member", "admin", "accountant", "approver", "viewer"]
 
 class AccountOut(UserOut):
     role: MemberRole
+    is_active: bool = True
+    membership_active: bool = True
+    invitation_pending: bool = False
 
 class ProfileUpdateIn(BaseModel):
     full_name: str = Field(min_length=1, max_length=200)
@@ -98,11 +101,25 @@ class OrganizationOut(ORMModel):
     currency: str
     logo_key: str | None = None
     logo_url: str | None = None
+    address: str | None = None
+    postal_code: str | None = None
+    city: str | None = None
+    vat_number: str | None = None
+    payment_information: str | None = None
+    payment_terms: str | None = None
+    invoice_prefix: str = "INV"
 
 class OrganizationUpdateIn(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     country: str = Field(default="DK", min_length=2, max_length=2)
-    currency: str = Field(default="DKK", min_length=1, max_length=10)
+    currency: str = Field(default="DKK", pattern=r"^[A-Za-z]{3}$")
+    address: str | None = Field(default=None, max_length=300)
+    postal_code: str | None = Field(default=None, max_length=30)
+    city: str | None = Field(default=None, max_length=100)
+    vat_number: str | None = Field(default=None, max_length=80)
+    payment_information: str | None = Field(default=None, max_length=2000)
+    payment_terms: str | None = Field(default=None, max_length=2000)
+    invoice_prefix: str = Field(default="INV", pattern=r"^[A-Za-z0-9-]{1,20}$")
 
     @field_validator("name", "country", "currency", mode="before")
     @classmethod
@@ -122,16 +139,20 @@ class SetupOrgOut(ORMModel):
     logo_key: str | None = None
     logo_url: str | None = None
 class CustomerIn(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     email: EmailStr|None=None
-    phone: str|None=None
-    address: str|None=None
-    postal_code: str|None=None
-    city: str|None=None
-    country: str="DK"
-    vat_number: str|None=None
-    payment_information: str|None=None
-    notes: str|None=None
+    phone: str|None=Field(default=None, max_length=50)
+    address: str|None=Field(default=None, max_length=300)
+    postal_code: str|None=Field(default=None, max_length=30)
+    city: str|None=Field(default=None, max_length=100)
+    country: str=Field(default="DK", pattern=r"^[A-Za-z]{2}$")
+    vat_number: str|None=Field(default=None, max_length=80)
+    payment_information: str|None=Field(default=None, max_length=2000)
+    notes: str|None=Field(default=None, max_length=5000)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def clean_name(cls, value): return value.strip() if isinstance(value, str) else value
 
     @field_validator("email", "phone", "address", "postal_code", "city", "vat_number", "payment_information", "notes", mode="before")
     @classmethod
@@ -149,8 +170,34 @@ class ProductIn(BaseModel):
         return value.strip() if isinstance(value, str) else value
 
 class ProductOut(ORMModel): id: UUID; name: str; unit_price: Decimal
-class InvoiceLineIn(BaseModel): description: str=Field(min_length=1,max_length=500); quantity: Decimal=Field(gt=0); unit_price: Decimal=Field(ge=0); tax_rate: Decimal=Field(ge=0,le=100)
-class InvoiceIn(BaseModel): invoice_number: str; invoice_type: InvoiceType=InvoiceType.outgoing; customer_id: UUID|None=None; supplier_id: UUID|None=None; issue_date: date; due_date: date; currency: str="DKK"; notes: str|None=None; lines: list[InvoiceLineIn]=Field(min_length=1)
+class InvoiceLineIn(BaseModel):
+    description: str = Field(min_length=1, max_length=500)
+    quantity: Decimal = Field(gt=0, max_digits=12, decimal_places=3)
+    unit_price: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
+    tax_rate: Decimal = Field(ge=0, le=100, max_digits=6, decimal_places=3)
+
+class InvoiceIn(BaseModel):
+    invoice_number: str = Field(default="", max_length=100)
+    invoice_type: InvoiceType = InvoiceType.outgoing
+    customer_id: UUID | None = None
+    supplier_id: UUID | None = None
+    issue_date: date
+    due_date: date
+    currency: str = Field(default="DKK", pattern=r"^[A-Za-z]{3}$")
+    notes: str | None = Field(default=None, max_length=5000)
+    lines: list[InvoiceLineIn] = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_invoice(self):
+        self.currency = self.currency.upper()
+        self.invoice_number = self.invoice_number.strip()
+        if self.due_date < self.issue_date:
+            raise ValueError("Due date must not be before issue date")
+        if self.invoice_type == InvoiceType.incoming and not self.invoice_number:
+            raise ValueError("Supplier invoice number is required")
+        if self.customer_id and self.supplier_id:
+            raise ValueError("Choose either a customer or supplier")
+        return self
 class InvoiceLineOut(ORMModel): id: UUID; description: str; quantity: Decimal; unit_price: Decimal; tax_rate: Decimal; line_total: Decimal
 class InvoiceOut(ORMModel):
     id: UUID
@@ -181,9 +228,11 @@ class InvoiceOut(ORMModel):
     due_amount: Decimal = Decimal("0.00")
     notes: str | None
     created_at: datetime
+    issued_at: datetime | None = None
+    is_overdue: bool = False
 
 class ManualPaymentIn(BaseModel):
-    amount: Decimal | None = None
+    amount: Decimal | None = Field(default=None, gt=0, max_digits=14, decimal_places=2)
     payment_date: date | None = None
     payment_method: str = "manual"
     reference: str | None = None
@@ -201,11 +250,11 @@ class InvoicePaymentOut(ORMModel):
 
 class LinkTransactionIn(BaseModel):
     transaction_id: UUID
-    amount: Decimal | None = None
+    amount: Decimal | None = Field(default=None, gt=0, max_digits=14, decimal_places=2)
 
 class LinkInvoiceIn(BaseModel):
     invoice_id: UUID
-    amount: Decimal | None = None
+    amount: Decimal | None = Field(default=None, gt=0, max_digits=14, decimal_places=2)
 
 class InvoiceMatchOut(ORMModel):
     id: UUID
@@ -257,5 +306,6 @@ class BankAuthorizeIn(BaseModel):
     aspsp_name: str | None = None
     aspsp_country: str | None = None
 class BankCallbackIn(BaseModel):
-    code: str
+    code: str = Field(min_length=1, max_length=2000)
+    state: str = Field(min_length=1, max_length=200)
 

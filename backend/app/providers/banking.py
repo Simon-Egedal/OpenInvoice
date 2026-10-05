@@ -31,6 +31,7 @@ class BankingProvider(ABC):
         callback_url: str,
         aspsp_name: str | None = None,
         aspsp_country: str | None = None,
+        state: str | None = None,
     ) -> str: ...
 
     @abstractmethod
@@ -120,8 +121,9 @@ class MockBankingProvider(BankingProvider):
         callback_url: str,
         aspsp_name: str | None = None,
         aspsp_country: str | None = None,
+        state: str | None = None,
     ) -> str:
-        return f"{callback_url}?code=mock-{uuid4()}"
+        return f"{callback_url}?" + urlencode({"code": f"mock-{uuid4()}", "state": state or ""})
 
     async def handle_callback(self, code: str) -> dict:
         return {
@@ -294,6 +296,7 @@ class EnableBankingProvider(BankingProvider):
         callback_url: str,
         aspsp_name: str | None = None,
         aspsp_country: str | None = None,
+        state: str | None = None,
     ) -> str:
         country = (aspsp_country or "DK").upper()
         if not aspsp_name:
@@ -315,7 +318,7 @@ class EnableBankingProvider(BankingProvider):
                 "valid_until": (datetime.now(timezone.utc) + timedelta(days=90)).isoformat(),
             },
             "aspsp": {"name": aspsp_name, "country": country},
-            "state": str(uuid4()),
+            "state": state or str(uuid4()),
             "redirect_url": callback_url,
             "psu_type": "personal",
         }

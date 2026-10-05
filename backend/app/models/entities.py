@@ -1,8 +1,8 @@
 import enum
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, JSON, Numeric, String, Text, UniqueConstraint, Index, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
@@ -18,7 +18,7 @@ class MemberRole(str, enum.Enum):
     owner="owner"; admin="admin"; accountant="accountant"; approver="approver"; member="member"; viewer="viewer"
 class InvoiceType(str, enum.Enum): incoming="incoming"; outgoing="outgoing"
 class InvoiceStatus(str, enum.Enum):
-    draft="draft"; received="received"; pending_approval="pending_approval"; approved="approved"; sent="sent"; partially_paid="partially_paid"; paid="paid"; overdue="overdue"; cancelled="cancelled"; rejected="rejected"
+    draft="draft"; issued="issued"; received="received"; pending_approval="pending_approval"; approved="approved"; sent="sent"; partially_paid="partially_paid"; paid="paid"; overdue="overdue"; cancelled="cancelled"; rejected="rejected"
 
 class User(IdMixin, TimestampMixin, Base):
     __tablename__="users"
@@ -26,6 +26,7 @@ class User(IdMixin, TimestampMixin, Base):
     password_hash: Mapped[str]=mapped_column(String(255))
     full_name: Mapped[str]=mapped_column(String(200))
     is_active: Mapped[bool]=mapped_column(Boolean, default=True)
+    session_version: Mapped[int] = mapped_column(Integer, default=0)
 
 class Organization(IdMixin, TimestampMixin, Base):
     __tablename__="organizations"
@@ -33,6 +34,14 @@ class Organization(IdMixin, TimestampMixin, Base):
     country: Mapped[str]=mapped_column(String(2), default="DK")
     currency: Mapped[str]=mapped_column(String(3), default="DKK")
     logo_key: Mapped[str|None]=mapped_column(String(500), nullable=True)
+    address: Mapped[str | None] = mapped_column(String(300))
+    postal_code: Mapped[str | None] = mapped_column(String(30))
+    city: Mapped[str | None] = mapped_column(String(100))
+    vat_number: Mapped[str | None] = mapped_column(String(80))
+    payment_information: Mapped[str | None] = mapped_column(Text)
+    payment_terms: Mapped[str | None] = mapped_column(Text)
+    invoice_prefix: Mapped[str] = mapped_column(String(20), default="INV")
+    next_invoice_number: Mapped[int] = mapped_column(Integer, default=1)
 
 class OrganizationMember(IdMixin, TimestampMixin, Base):
     __tablename__="organization_members"
@@ -40,6 +49,17 @@ class OrganizationMember(IdMixin, TimestampMixin, Base):
     organization_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
     user_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True)
     role: Mapped[MemberRole]=mapped_column(Enum(MemberRole, name="member_role"), default=MemberRole.member)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+class AccountToken(IdMixin, TimestampMixin, Base):
+    __tablename__ = "account_tokens"
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    purpose: Mapped[str] = mapped_column(String(20))
+    session_version: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 class Party(IdMixin, TimestampMixin, Base):
     __abstract__=True
@@ -65,6 +85,10 @@ class Product(IdMixin, TimestampMixin, Base):
 
 class Invoice(IdMixin, TimestampMixin, Base):
     __tablename__="invoices"
+    __table_args__ = (
+        Index("uq_outgoing_number", "organization_id", "invoice_number", unique=True, postgresql_where=text("invoice_type = 'outgoing'")),
+        Index("uq_supplier_invoice_number", "organization_id", "supplier_id", "invoice_number", unique=True, postgresql_where=text("invoice_type = 'incoming'")),
+    )
     organization_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
     customer_id: Mapped[uuid.UUID|None]=mapped_column(UUID(as_uuid=True), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True)
     supplier_id: Mapped[uuid.UUID|None]=mapped_column(UUID(as_uuid=True), ForeignKey("suppliers.id", ondelete="SET NULL"), nullable=True)
@@ -80,19 +104,28 @@ class Invoice(IdMixin, TimestampMixin, Base):
     total: Mapped[Decimal]=mapped_column(Numeric(14,2), default=Decimal("0"))
     paid_amount: Mapped[Decimal]=mapped_column(Numeric(14,2), default=Decimal("0"))
     notes: Mapped[str|None]=mapped_column(Text, nullable=True)
+    issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    issued_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    issued_pdf_key: Mapped[str | None] = mapped_column(String(500))
 
     @property
     def due_amount(self) -> Decimal:
         return max(Decimal("0.00"), self.total - (self.paid_amount or Decimal("0.00")))
 
+    @property
+    def is_overdue(self) -> bool:
+        return self.status in {InvoiceStatus.issued, InvoiceStatus.sent, InvoiceStatus.approved, InvoiceStatus.received, InvoiceStatus.partially_paid, InvoiceStatus.overdue} and self.due_amount > 0 and self.due_date < datetime.now(timezone.utc).date()
+
 class InvoiceLine(IdMixin, Base):
     __tablename__="invoice_lines"
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
     invoice_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("invoices.id", ondelete="CASCADE"), index=True)
     description: Mapped[str]=mapped_column(String(500))
     quantity: Mapped[Decimal]=mapped_column(Numeric(12,3))
     unit_price: Mapped[Decimal]=mapped_column(Numeric(14,2))
     tax_rate: Mapped[Decimal]=mapped_column(Numeric(6,3), default=Decimal("0"))
     line_total: Mapped[Decimal]=mapped_column(Numeric(14,2))
+    position: Mapped[int] = mapped_column(Integer, default=0)
 
 class InvoiceDocument(IdMixin, TimestampMixin, Base):
     __tablename__="invoice_documents"
@@ -135,6 +168,7 @@ class BankTransaction(IdMixin, TimestampMixin, Base):
     reference: Mapped[str|None]=mapped_column(String(200), nullable=True)
 class InvoiceTransactionMatch(IdMixin, TimestampMixin, Base):
     __tablename__="invoice_transaction_matches"
+    __table_args__ = (UniqueConstraint("organization_id", "invoice_id", "transaction_id", name="uq_invoice_transaction"),)
     organization_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
     invoice_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("invoices.id", ondelete="CASCADE"), index=True)
     transaction_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("bank_transactions.id", ondelete="CASCADE"), index=True)
@@ -153,14 +187,28 @@ class InvoicePayment(IdMixin, TimestampMixin, Base):
     notes: Mapped[str|None]=mapped_column(Text, nullable=True)
 class EmailDelivery(IdMixin, TimestampMixin, Base):
     __tablename__="email_deliveries"
+    __table_args__ = (UniqueConstraint("organization_id", "idempotency_key", name="uq_delivery_request"),)
     organization_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
-    invoice_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("invoices.id", ondelete="CASCADE"))
+    invoice_id: Mapped[uuid.UUID | None]=mapped_column(UUID(as_uuid=True), ForeignKey("invoices.id", ondelete="CASCADE"), nullable=True)
     recipient: Mapped[str]=mapped_column(String(320))
     status: Mapped[str]=mapped_column(String(30), default="queued")
     failed_attempts: Mapped[int]=mapped_column(Integer, default=0)
     error_message: Mapped[str|None]=mapped_column(Text, nullable=True)
     provider_message_id: Mapped[str|None]=mapped_column(String(200), nullable=True)
     sent_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
+    kind: Mapped[str] = mapped_column(String(20), default="invoice")
+    idempotency_key: Mapped[str | None] = mapped_column(String(200))
+    encrypted_payload: Mapped[str | None] = mapped_column(Text)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=now_utc, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+class InvoiceDecision(IdMixin, TimestampMixin, Base):
+    __tablename__ = "invoice_decisions"
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    invoice_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("invoices.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
+    decision: Mapped[str] = mapped_column(String(30))
+    reason: Mapped[str | None] = mapped_column(Text)
 class AuditLog(IdMixin, Base):
     __tablename__="audit_logs"
     organization_id: Mapped[uuid.UUID]=mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), index=True)

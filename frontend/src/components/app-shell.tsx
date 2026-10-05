@@ -12,6 +12,7 @@ const links = [
   { href: "/customers", label: "Customers", icon: Users },
   { href: "/suppliers", label: "Suppliers", icon: Building2 },
   { href: "/products", label: "Products", icon: Package },
+  { href: "/data", label: "Import / export", icon: FileText },
   { href: "/audit", label: "Activity", icon: Activity },
 ];
 
@@ -42,7 +43,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           if (path.startsWith("/setup")) router.replace("/");
         }
       })
-      .catch(() => {});
+      .catch(e => setAuthError(e instanceof Error ? e.message : "Unable to load application settings"));
   }, [path, router]);
 
   useEffect(() => {
@@ -61,10 +62,10 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     fetchUser();
     window.addEventListener("profileUpdated", fetchUser);
     return () => { active = false; window.removeEventListener("profileUpdated", fetchUser); };
-  }, [path]);
+  }, [path, currentUser?.id]);
 
   useEffect(() => {
-    if (authChecked && !currentUser && path !== "/auth" && !path.startsWith("/setup")) {
+    if (authChecked && !currentUser && !path.startsWith("/auth") && !path.startsWith("/setup")) {
       router.replace("/auth");
     }
   }, [authChecked, currentUser, path, router]);
@@ -86,20 +87,20 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   useEffect(() => {
-    if (path.startsWith("/setup") || path === "/auth") return;
+    if (path.startsWith("/setup") || path.startsWith("/auth") || !currentUser) return;
     const fetchOrg = () => {
       api<Organization[]>("/organizations")
         .then((orgs) => {
           if (orgs && orgs.length > 0) setCurrentOrg(orgs[0]);
         })
-        .catch(() => {});
+        .catch(e => setAuthError(e instanceof Error ? e.message : "Unable to load application settings"));
     };
     fetchOrg();
     window.addEventListener("organizationUpdated", fetchOrg);
 
     api<Invoice[]>("/invoices")
       .then((items) => {
-        setInvoiceCount(Array.isArray(items) ? items.length : 0);
+        setInvoiceCount(null);
       })
       .catch(() => {
         setInvoiceCount(null);
@@ -108,15 +109,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     return () => {
       window.removeEventListener("organizationUpdated", fetchOrg);
     };
-  }, [path]);
+  }, [path, currentUser?.id]);
 
 
   if (path === "/setup" || path.startsWith("/setup/")) {
     return <main className="setup-shell">{children}</main>;
   }
 
-  if (!authChecked || !currentUser) {
+  if (path.startsWith("/auth")) {
     return <main className="signed-out-area">{children}</main>;
+  }
+  if (!currentUser) {
+    return <main className="signed-out-area"><p role="status">Checking sign-in…</p></main>;
   }
 
   return (

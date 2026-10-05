@@ -1,16 +1,13 @@
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from io import BytesIO
+from typing import Annotated
 from uuid import UUID
 import asyncio
 import smtplib
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import StreamingResponse
+import secrets
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile, Header, Query
 from PIL import Image
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.utils import ImageReader
-from reportlab.pdfgen import canvas
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, or_
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -77,13 +74,19 @@ from app.schemas import (
     SupplierOut,
     UserOut,
 )
+from app.invoice_pdf import make_pdf
+from app.invoice_documents import invoice_content, issue_invoice
+from app.deliveries import queue_invoice
+from app.accounts import invite_account
+from app.invoice_receiving import receive_supplier_invoice
 from app.services import (
-    create_member_account,
+    reserve_invoice_number,
     update_user_profile,
     change_user_password,
     create_initial_admin,
     create_initial_organization,
     create_invoice,
+    update_invoice_draft,
     delete_manual_payment,
     get_infrastructure_config,
     link_invoice_to_transaction,
@@ -269,6 +272,7 @@ async def setup_admin(
         raise HTTPException(422, msg) from exc
 
     request.session["user_id"] = str(user.id)
+    request.session["session_version"] = user.session_version or 0
     return user
 
 @router.get("/organizations/{org_id}/logo")
@@ -305,13 +309,13 @@ async def register(payload:RegisterIn,request:Request,db:AsyncSession=Depends(ge
     if await db.scalar(select(User).where(User.email==payload.email.lower())): raise HTTPException(409,"Email already registered")
     user=User(email=payload.email.lower(),password_hash=hash_password(payload.password),full_name=payload.full_name)
     org=Organization(name=payload.organization_name)
-    db.add_all([user,org]); await db.flush(); db.add(OrganizationMember(user_id=user.id,organization_id=org.id,role="owner")); await db.commit(); await db.refresh(user); request.session["user_id"]=str(user.id)
+    db.add_all([user,org]); await db.flush(); db.add(OrganizationMember(user_id=user.id,organization_id=org.id,role="owner")); await db.commit(); await db.refresh(user); request.session["user_id"]=str(user.id); request.session["session_version"]=user.session_version or 0
     return user
 @router.post("/auth/login",response_model=UserOut)
 async def login(payload:LoginIn,request:Request,db:AsyncSession=Depends(get_db)):
     user=await db.scalar(select(User).where(User.email==payload.email.lower()))
     if not user or not user.is_active or not verify_password(payload.password,user.password_hash): raise HTTPException(401,"Invalid email or password")
-    request.session["user_id"]=str(user.id); return user
+    request.session["user_id"]=str(user.id); request.session["session_version"]=user.session_version or 0; return user
 @router.post("/auth/logout",status_code=204)
 async def logout(request:Request): request.session.clear(); return Response(status_code=204)
 @router.get("/auth/me",response_model=CurrentUserOut)
@@ -323,21 +327,22 @@ async def update_profile(payload: ProfileUpdateIn, user: User = Depends(current_
     return await update_user_profile(db, user, payload.full_name)
 
 @router.post("/auth/password", status_code=204)
-async def change_password(payload: PasswordChangeIn, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
+async def change_password(payload: PasswordChangeIn, request: Request, user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     await change_user_password(db, user, payload.current_password, payload.new_password)
+    request.session["session_version"] = user.session_version
     return Response(status_code=204)
 
 @router.get("/administration/accounts", response_model=list[AccountOut])
-async def list_accounts(m: OrganizationMember = Depends(admin_membership), db: AsyncSession = Depends(get_db)):
-    rows = await db.execute(select(User, OrganizationMember.role).join(OrganizationMember, OrganizationMember.user_id == User.id)
-                            .where(OrganizationMember.organization_id == m.organization_id).order_by(User.email))
-    return [{"id": user.id, "email": user.email, "full_name": user.full_name, "role": role} for user, role in rows.all()]
+async def list_accounts(m: OrganizationMember = Depends(admin_membership), db: AsyncSession = Depends(get_db), limit: Annotated[int, Query(ge=1,le=500)]=100, offset: Annotated[int, Query(ge=0)]=0):
+    rows = await db.execute(select(User, OrganizationMember).join(OrganizationMember, OrganizationMember.user_id == User.id)
+                            .where(OrganizationMember.organization_id == m.organization_id).order_by(User.email, User.id).limit(limit).offset(offset))
+    return [{"id": user.id, "email": user.email, "full_name": user.full_name, "role": membership.role, "is_active": user.is_active and membership.is_active, "membership_active": membership.is_active, "invitation_pending": not user.is_active} for user, membership in rows.all()]
 
 @router.post("/administration/accounts", response_model=AccountOut, status_code=201)
 async def create_account(payload: AccountCreateIn, m: OrganizationMember = Depends(admin_membership),
                          user: User = Depends(current_user), db: AsyncSession = Depends(get_db),
                          provider = Depends(email_provider)):
-    return await create_member_account(db, payload, m, user, provider)
+    return await invite_account(db, payload, m, user)
 @router.get("/organizations", response_model=list[OrganizationOut])
 async def organizations(user: User = Depends(current_user), db: AsyncSession = Depends(get_db)):
     rows = await db.execute(
@@ -353,6 +358,7 @@ async def organizations(user: User = Depends(current_user), db: AsyncSession = D
             "country": o.country,
             "currency": o.currency,
             "logo_key": o.logo_key,
+            **{name: getattr(o, name) for name in ("address", "postal_code", "city", "vat_number", "payment_information", "payment_terms", "invoice_prefix")},
             "logo_url": f"/organizations/{o.id}/logo" if o.logo_key else None,
         }
         for o in orgs
@@ -372,6 +378,7 @@ async def get_current_organization(
         "country": org.country,
         "currency": org.currency,
         "logo_key": org.logo_key,
+        **{name: getattr(org, name) for name in ("address", "postal_code", "city", "vat_number", "payment_information", "payment_terms", "invoice_prefix")},
         "logo_url": f"/organizations/{org.id}/logo" if org.logo_key else None,
     }
 
@@ -389,6 +396,9 @@ async def update_current_organization(
     org.name = payload.name.strip()
     org.country = payload.country.strip().upper()
     org.currency = payload.currency.strip().upper()
+    for name in ("address", "postal_code", "city", "vat_number", "payment_information", "payment_terms", "invoice_prefix"):
+        if name in payload.model_fields_set:
+            setattr(org, name, getattr(payload, name))
 
     db.add(AuditLog(
         organization_id=org.id,
@@ -407,6 +417,7 @@ async def update_current_organization(
         "country": org.country,
         "currency": org.currency,
         "logo_key": org.logo_key,
+        **{name: getattr(org, name) for name in ("address", "postal_code", "city", "vat_number", "payment_information", "payment_terms", "invoice_prefix")},
         "logo_url": f"/organizations/{org.id}/logo" if org.logo_key else None,
     }
 
@@ -449,6 +460,7 @@ async def upload_current_organization_logo(
         "country": org.country,
         "currency": org.currency,
         "logo_key": org.logo_key,
+        **{name: getattr(org, name) for name in ("address", "postal_code", "city", "vat_number", "payment_information", "payment_terms", "invoice_prefix")},
         "logo_url": f"/organizations/{org.id}/logo" if org.logo_key else None,
     }
 
@@ -500,16 +512,20 @@ async def create_organization(payload: dict, user: User = Depends(current_user),
         "country": org.country,
         "currency": org.currency,
         "logo_key": org.logo_key,
+        **{name: getattr(org, name) for name in ("address", "postal_code", "city", "vat_number", "payment_information", "payment_terms", "invoice_prefix")},
         "logo_url": f"/organizations/{org.id}/logo" if org.logo_key else None,
     }
 
 
-async def entity_list(model, db, org_id):
-    result=await db.execute(select(model).where(model.organization_id==org_id).order_by(model.name)); return result.scalars().all()
-@router.get("/products", response_model=list[ProductOut])
-async def products(m=Depends(current_membership), db:AsyncSession=Depends(get_db)):
-    result = await db.execute(select(Product).where(Product.organization_id == m.organization_id).order_by(Product.name))
+async def entity_list(model, db, org_id, limit=100, offset=0, q=""):
+    query = select(model).where(model.organization_id == org_id)
+    if q:
+        query = query.where(model.name.ilike(f"%{q}%"))
+    result = await db.execute(query.order_by(model.name, model.id).limit(limit).offset(offset))
     return result.scalars().all()
+@router.get("/products", response_model=list[ProductOut])
+async def products(m=Depends(current_membership), db:AsyncSession=Depends(get_db), limit: Annotated[int, Query(ge=1, le=500)]=100, offset: Annotated[int, Query(ge=0)]=0, q: Annotated[str, Query(max_length=200)]=""):
+    return await entity_list(Product, db, m.organization_id, limit, offset, q)
 
 @router.post("/products", response_model=ProductOut, status_code=201)
 async def add_product(payload:ProductIn, user=Depends(current_user), m=Depends(write_membership), db:AsyncSession=Depends(get_db)):
@@ -532,7 +548,7 @@ async def delete_product(item_id:UUID, user=Depends(current_user), m=Depends(wri
     return Response(status_code=204)
 
 @router.get("/customers",response_model=list[CustomerOut])
-async def customers(m=Depends(current_membership),db:AsyncSession=Depends(get_db)): return await entity_list(Customer,db,m.organization_id)
+async def customers(m=Depends(current_membership),db:AsyncSession=Depends(get_db),limit: Annotated[int, Query(ge=1, le=500)]=100,offset: Annotated[int, Query(ge=0)]=0,q: Annotated[str, Query(max_length=200)]=""): return await entity_list(Customer,db,m.organization_id,limit,offset,q)
 @router.post("/customers",response_model=CustomerOut,status_code=201)
 async def add_customer(payload:CustomerIn,user=Depends(current_user),m=Depends(write_membership),db:AsyncSession=Depends(get_db)):
     item=Customer(**payload.model_dump(),organization_id=m.organization_id); db.add(item); await db.flush(); db.add(AuditLog(organization_id=m.organization_id,user_id=user.id,action="customer.created",entity_type="customer",entity_id=item.id,new_values={"name":item.name})); await db.commit(); await db.refresh(item); return item
@@ -542,13 +558,15 @@ async def get_customer(item_id:UUID,m=Depends(current_membership),db:AsyncSessio
     if not item: raise HTTPException(404,"Customer not found")
     return item
 @router.patch("/customers/{item_id}",response_model=CustomerOut)
-async def update_customer(item_id:UUID,payload:CustomerIn,m=Depends(write_membership),db:AsyncSession=Depends(get_db)):
+async def update_customer(item_id:UUID,payload:CustomerIn,user=Depends(current_user),m=Depends(write_membership),db:AsyncSession=Depends(get_db)):
     item=await db.scalar(select(Customer).where(Customer.id==item_id,Customer.organization_id==m.organization_id));
     if not item: raise HTTPException(404,"Customer not found")
+    old_values = {key: getattr(item, key) for key in payload.model_fields}
+    db.add(AuditLog(organization_id=m.organization_id,user_id=user.id,action="customer.updated",entity_type="customer",entity_id=item.id,old_values=old_values,new_values=payload.model_dump(mode="json")))
     for key,value in payload.model_dump().items(): setattr(item,key,value)
     await db.commit(); await db.refresh(item); return item
 @router.get("/suppliers",response_model=list[SupplierOut])
-async def suppliers(m=Depends(current_membership),db:AsyncSession=Depends(get_db)): return await entity_list(Supplier,db,m.organization_id)
+async def suppliers(m=Depends(current_membership),db:AsyncSession=Depends(get_db),limit: Annotated[int, Query(ge=1, le=500)]=100,offset: Annotated[int, Query(ge=0)]=0,q: Annotated[str, Query(max_length=200)]=""): return await entity_list(Supplier,db,m.organization_id,limit,offset,q)
 @router.post("/suppliers",response_model=SupplierOut,status_code=201)
 async def add_supplier(payload:SupplierIn,user=Depends(current_user),m=Depends(write_membership),db:AsyncSession=Depends(get_db)):
     item=Supplier(**payload.model_dump(),organization_id=m.organization_id); db.add(item); await db.flush(); db.add(AuditLog(organization_id=m.organization_id,user_id=user.id,action="supplier.created",entity_type="supplier",entity_id=item.id,new_values={"name":item.name})); await db.commit(); await db.refresh(item); return item
@@ -558,13 +576,24 @@ async def get_supplier(item_id:UUID,m=Depends(current_membership),db:AsyncSessio
     if not item: raise HTTPException(404,"Supplier not found")
     return item
 @router.patch("/suppliers/{item_id}",response_model=SupplierOut)
-async def update_supplier(item_id:UUID,payload:SupplierIn,m=Depends(write_membership),db:AsyncSession=Depends(get_db)):
+async def update_supplier(item_id:UUID,payload:SupplierIn,user=Depends(current_user),m=Depends(write_membership),db:AsyncSession=Depends(get_db)):
     item=await db.scalar(select(Supplier).where(Supplier.id==item_id,Supplier.organization_id==m.organization_id));
     if not item: raise HTTPException(404,"Supplier not found")
+    old_values = {key: getattr(item, key) for key in payload.model_fields}
+    db.add(AuditLog(organization_id=m.organization_id,user_id=user.id,action="supplier.updated",entity_type="supplier",entity_id=item.id,old_values=old_values,new_values=payload.model_dump(mode="json")))
     for key,value in payload.model_dump().items(): setattr(item,key,value)
     await db.commit(); await db.refresh(item); return item
 
 async def attach_organization_metadata(db: AsyncSession, invoice: Invoice) -> Invoice:
+    if invoice.issued_snapshot:
+        org = invoice.issued_snapshot["organization"]
+        recipient = invoice.issued_snapshot["recipient"]
+        invoice.organization_name = org["name"]
+        invoice.organization_logo_url = None
+        for name in ("name", "email", "phone", "address", "postal_code", "city", "country", "vat_number"):
+            setattr(invoice, f"recipient_{name}", recipient.get(name))
+        invoice.recipient = None
+        return invoice
     try:
         org = await db.scalar(select(Organization).where(Organization.id == invoice.organization_id))
         if org:
@@ -609,6 +638,9 @@ async def attach_organization_metadata_list(db: AsyncSession, invoices: list[Inv
             suppliers = {s.id: s for s in supp_res.scalars().all()}
 
         for inv in invoices:
+            if inv.issued_snapshot:
+                await attach_organization_metadata(db, inv)
+                continue
             if org_name:
                 setattr(inv, "organization_name", org_name)
             setattr(inv, "organization_logo_url", logo_url)
@@ -628,8 +660,21 @@ async def attach_organization_metadata_list(db: AsyncSession, invoices: list[Inv
     return invoices
 
 @router.get("/invoices",response_model=list[InvoiceOut])
-async def invoices(m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
-    result=await db.execute(select(Invoice).where(Invoice.organization_id==m.organization_id).order_by(Invoice.created_at.desc()))
+async def invoices(m=Depends(current_membership),db:AsyncSession=Depends(get_db),limit: Annotated[int, Query(ge=1,le=500)]=100,offset: Annotated[int, Query(ge=0)]=0,q: Annotated[str, Query(max_length=200)]="",status: InvoiceStatus | None=None,invoice_type: InvoiceType | None=None,currency: str | None=None,unpaid: bool=False):
+    query = select(Invoice).where(Invoice.organization_id == m.organization_id)
+    if q:
+        query = query.outerjoin(Customer, Customer.id == Invoice.customer_id).outerjoin(Supplier, Supplier.id == Invoice.supplier_id).where(or_(Invoice.invoice_number.ilike(f"%{q}%"), Customer.name.ilike(f"%{q}%"), Supplier.name.ilike(f"%{q}%")))
+    if status == InvoiceStatus.overdue:
+        query = query.where(Invoice.due_date < datetime.now(timezone.utc).date(), Invoice.total > Invoice.paid_amount, Invoice.status.in_([InvoiceStatus.issued, InvoiceStatus.sent, InvoiceStatus.partially_paid, InvoiceStatus.received, InvoiceStatus.approved, InvoiceStatus.overdue]))
+    elif status:
+        query = query.where(Invoice.status == status)
+    if invoice_type:
+        query = query.where(Invoice.invoice_type == invoice_type)
+    if currency:
+        query = query.where(Invoice.currency == currency.upper())
+    if unpaid:
+        query = query.where(Invoice.total > Invoice.paid_amount, Invoice.status.in_([InvoiceStatus.issued, InvoiceStatus.sent, InvoiceStatus.approved, InvoiceStatus.partially_paid, InvoiceStatus.overdue]))
+    result=await db.execute(query.order_by(Invoice.created_at.desc(), Invoice.id.desc()).limit(limit).offset(offset))
     items = result.scalars().all()
     await attach_organization_metadata_list(db, items, m.organization_id)
     return items
@@ -643,40 +688,13 @@ async def add_invoice(payload:InvoiceIn,user=Depends(current_user),m=Depends(wri
     await attach_organization_metadata(db, invoice)
     return invoice
 @router.post("/invoices/receive",response_model=InvoiceOut,status_code=201)
-async def receive_invoice(user=Depends(current_user),m=Depends(write_membership),db:AsyncSession=Depends(get_db),invoice_number:str=Form(min_length=1,max_length=100),supplier_id:UUID=Form(),issue_date:date=Form(),due_date:date=Form(),description:str=Form(min_length=1,max_length=500),net_amount:Decimal=Form(gt=0),tax_rate:Decimal=Form(ge=0,le=100),currency:str=Form(default="DKK"),document:UploadFile=File()):
-    if not await db.scalar(select(Supplier.id).where(Supplier.id==supplier_id,Supplier.organization_id==m.organization_id)): raise HTTPException(422,"Choose a supplier from this organization")
-    if document.content_type!="application/pdf": raise HTTPException(415,"Only PDF invoices are accepted")
-    content=await document.read(20*1024*1024+1)
-    if len(content)>20*1024*1024: raise HTTPException(413,"Invoice PDF must be 20 MB or smaller")
-    if not content.startswith(b"%PDF-"): raise HTTPException(415,"Uploaded file is not a valid PDF")
-    if due_date<issue_date: raise HTTPException(422,"Due date must not be before issue date")
-    safe_name=(document.filename or "invoice.pdf").replace("\\","/").split("/")[-1][:255] or "invoice.pdf"
-    key=await storage_provider().put(content,safe_name,"application/pdf")
-    amount=money(net_amount); tax=money(amount*tax_rate/Decimal("100"))
-    invoice=Invoice(organization_id=m.organization_id,created_by=user.id,invoice_number=invoice_number,invoice_type=InvoiceType.incoming,status=InvoiceStatus.received,supplier_id=supplier_id,issue_date=issue_date,due_date=due_date,currency=currency.upper(),subtotal=amount,tax_amount=tax,total=money(amount+tax))
-    db.add(invoice); await db.flush(); db.add(InvoiceLine(invoice_id=invoice.id,description=description,quantity=Decimal("1"),unit_price=amount,tax_rate=tax_rate,line_total=amount)); db.add(InvoiceDocument(organization_id=m.organization_id,invoice_id=invoice.id,storage_key=key,original_filename=safe_name,content_type="application/pdf",size_bytes=len(content))); db.add(AuditLog(organization_id=m.organization_id,user_id=user.id,action="invoice.received",entity_type="invoice",entity_id=invoice.id,new_values={"invoice_number":invoice_number,"document_name":safe_name})); await db.commit(); await db.refresh(invoice)
-    await attach_organization_metadata(db, invoice)
-    return invoice
+async def receive_invoice(user=Depends(current_user),m=Depends(write_membership),db:AsyncSession=Depends(get_db),invoice_number:str=Form(min_length=1,max_length=100),supplier_id:UUID=Form(),issue_date:date=Form(),due_date:date=Form(),description:str=Form(min_length=1,max_length=500),net_amount:Decimal=Form(gt=0,max_digits=14,decimal_places=2),tax_rate:Decimal=Form(ge=0,le=100,max_digits=6,decimal_places=3),currency:str=Form(default="DKK"),document:UploadFile=File()):
+    invoice = await receive_supplier_invoice(db, m.organization_id, user.id, invoice_number=invoice_number, supplier_id=supplier_id, issue_date=issue_date, due_date=due_date, description=description, net_amount=net_amount, tax_rate=tax_rate, currency=currency, document=document)
+    return await attach_organization_metadata(db, invoice)
 @router.patch("/invoices/{invoice_id}",response_model=InvoiceOut)
 async def update_draft_invoice(invoice_id:UUID,payload:InvoiceIn,user=Depends(current_user),m=Depends(write_membership),db:AsyncSession=Depends(get_db)):
-    invoice=await db.scalar(select(Invoice).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id))
-    if not invoice: raise HTTPException(404,"Invoice not found")
-    if invoice.status!=InvoiceStatus.draft: raise HTTPException(409,"Only draft invoices can be edited")
-    if payload.invoice_type.value=="outgoing":
-        if not payload.customer_id or not await db.scalar(select(Customer.id).where(Customer.id==payload.customer_id,Customer.organization_id==m.organization_id)): raise HTTPException(422,"Choose a customer from this organization")
-    if payload.invoice_type.value=="incoming":
-        if not payload.supplier_id or not await db.scalar(select(Supplier.id).where(Supplier.id==payload.supplier_id,Supplier.organization_id==m.organization_id)): raise HTTPException(422,"Choose a supplier from this organization")
-    subtotal=Decimal("0"); tax=Decimal("0"); prepared=[]
-    for line in payload.lines:
-        amount=money(line.quantity*line.unit_price); subtotal+=amount; tax+=money(amount*line.tax_rate/Decimal("100")); prepared.append((line,amount))
-    for key in ("invoice_number","invoice_type","customer_id","supplier_id","issue_date","due_date","currency","notes"): setattr(invoice,key,getattr(payload,key))
-    invoice.currency=invoice.currency.upper(); invoice.subtotal=money(subtotal); invoice.tax_amount=money(tax); invoice.total=money(subtotal+tax)
-    await db.execute(delete(InvoiceLine).where(InvoiceLine.invoice_id==invoice.id))
-    for line,amount in prepared: db.add(InvoiceLine(invoice_id=invoice.id,description=line.description,quantity=line.quantity,unit_price=line.unit_price,tax_rate=line.tax_rate,line_total=amount))
-    db.add(AuditLog(organization_id=m.organization_id,user_id=user.id,action="invoice.updated",entity_type="invoice",entity_id=invoice.id,new_values={"invoice_number":invoice.invoice_number,"total":str(invoice.total)}))
-    await db.commit(); await db.refresh(invoice)
-    await attach_organization_metadata(db, invoice)
-    return invoice
+    invoice = await update_invoice_draft(db, payload, m.organization_id, user.id, invoice_id)
+    return await attach_organization_metadata(db, invoice)
 @router.get("/invoices/{invoice_id}",response_model=InvoiceOut)
 async def get_invoice(invoice_id:UUID,m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
     invoice=await db.scalar(select(Invoice).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id))
@@ -686,213 +704,39 @@ async def get_invoice(invoice_id:UUID,m=Depends(current_membership),db:AsyncSess
 @router.get("/invoices/{invoice_id}/lines",response_model=list[InvoiceLineOut])
 async def invoice_lines(invoice_id:UUID,m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
     if not await db.scalar(select(Invoice.id).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id)): raise HTTPException(404,"Invoice not found")
-    result=await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==invoice_id)); return result.scalars().all()
-def make_pdf(invoice, lines, org=None, logo_bytes=None, org_name=None, recipient=None):
-    if org_name is None:
-        if org is not None and getattr(org, "name", None):
-            org_name = org.name
-        elif getattr(invoice, "organization_name", None):
-            org_name = invoice.organization_name
-
-    recipient_name = None
-    recipient_address = None
-    recipient_city_line = None
-    recipient_vat = None
-    recipient_email = None
-    recipient_phone = None
-
-    if recipient is not None:
-        if isinstance(recipient, dict):
-            recipient_name = recipient.get("name")
-            recipient_address = recipient.get("address")
-            postal = recipient.get("postal_code") or ""
-            city = recipient.get("city") or ""
-            country = recipient.get("country") or ""
-            city_part = f"{postal} {city}".strip()
-            recipient_city_line = ", ".join(filter(None, [city_part, country])) or None
-            recipient_vat = recipient.get("vat_number")
-            recipient_email = recipient.get("email")
-            recipient_phone = recipient.get("phone")
-        else:
-            recipient_name = getattr(recipient, "name", None)
-            recipient_address = getattr(recipient, "address", None)
-            postal = getattr(recipient, "postal_code", None) or ""
-            city = getattr(recipient, "city", None) or ""
-            country = getattr(recipient, "country", None) or ""
-            city_part = f"{postal} {city}".strip()
-            recipient_city_line = ", ".join(filter(None, [city_part, country])) or None
-            recipient_vat = getattr(recipient, "vat_number", None)
-            recipient_email = getattr(recipient, "email", None)
-            recipient_phone = getattr(recipient, "phone", None)
-    elif getattr(invoice, "recipient_name", None):
-        recipient_name = getattr(invoice, "recipient_name", None)
-        recipient_address = getattr(invoice, "recipient_address", None)
-        postal = getattr(invoice, "recipient_postal_code", None) or ""
-        city = getattr(invoice, "recipient_city", None) or ""
-        country = getattr(invoice, "recipient_country", None) or ""
-        city_part = f"{postal} {city}".strip()
-        recipient_city_line = ", ".join(filter(None, [city_part, country])) or None
-        recipient_vat = getattr(invoice, "recipient_vat_number", None)
-        recipient_email = getattr(invoice, "recipient_email", None)
-        recipient_phone = getattr(invoice, "recipient_phone", None)
-
-    out = BytesIO()
-    doc = canvas.Canvas(out, pagesize=A4, pageCompression=0)
-    width, height = A4
-    y = height - 60
-
-    doc.setFillColorRGB(.1, .12, .14)
-    doc.setFont("Helvetica-Bold", 22)
-    doc.drawString(48, y, "INVOICE")
-    y -= 35
-    doc.setFont("Helvetica-Bold", 13)
-    doc.drawString(48, y, invoice.invoice_number)
-    y -= 24
-    doc.setFont("Helvetica", 10)
-    doc.drawString(48, y, f"Issue date  {invoice.issue_date}     Due date  {invoice.due_date}")
-
-    # Draw Organization Logo and Name on top right
-    right_x = width - 48
-    top_y = height - 48
-    rendered_logo = False
-
-    if logo_bytes:
-        try:
-            pil_img = Image.open(BytesIO(logo_bytes))
-            orig_w, orig_h = pil_img.size
-            if orig_w > 0 and orig_h > 0:
-                max_w, max_h = 140, 50
-                aspect = orig_w / orig_h
-                if orig_w / max_w > orig_h / max_h:
-                    img_w = max_w
-                    img_h = max_w / aspect
-                else:
-                    img_h = max_h
-                    img_w = max_h * aspect
-                img_x = right_x - img_w
-                img_y = top_y - img_h
-                doc.drawImage(ImageReader(pil_img), img_x, img_y, width=img_w, height=img_h, mask='auto', preserveAspectRatio=True)
-                rendered_logo = True
-                if org_name:
-                    doc.setFont("Helvetica-Bold", 12)
-                    doc.setFillColorRGB(.1, .12, .14)
-                    doc.drawRightString(right_x, img_y - 15, str(org_name)[:50])
-        except Exception:
-            rendered_logo = False
-
-    if not rendered_logo and org_name:
-        doc.setFont("Helvetica-Bold", 16)
-        doc.setFillColorRGB(.1, .12, .14)
-        doc.drawRightString(right_x, height - 60, str(org_name)[:50])
-
-    inv_type = getattr(invoice, "invoice_type", "outgoing")
-    if hasattr(inv_type, "value"):
-        inv_type = inv_type.value
-    recipient_label = "BILLED TO" if inv_type == "outgoing" else "SUPPLIER"
-
-    if recipient_name:
-        y -= 26
-        doc.setFont("Helvetica-Bold", 8)
-        doc.setFillColorRGB(.45, .48, .46)
-        doc.drawString(48, y, recipient_label)
-        y -= 14
-
-        doc.setFont("Helvetica-Bold", 11)
-        doc.setFillColorRGB(.1, .12, .14)
-        doc.drawString(48, y, str(recipient_name)[:60])
-        y -= 13
-
-        doc.setFont("Helvetica", 9)
-        doc.setFillColorRGB(.3, .33, .31)
-        if recipient_address:
-            doc.drawString(48, y, str(recipient_address)[:60])
-            y -= 12
-        if recipient_city_line:
-            doc.drawString(48, y, str(recipient_city_line)[:60])
-            y -= 12
-        if recipient_vat:
-            doc.drawString(48, y, f"VAT: {recipient_vat}"[:40])
-            y -= 12
-        contact_parts = list(filter(None, [recipient_email, recipient_phone]))
-        if contact_parts:
-            doc.drawString(48, y, " · ".join(contact_parts)[:60])
-            y -= 12
-        y -= 16
-    else:
-        y -= 42
-
-    doc.setFont("Helvetica-Bold", 10)
-    doc.setFillColorRGB(.1, .12, .14)
-    doc.drawString(48, y, "DESCRIPTION")
-    doc.drawRightString(width - 160, y, "QTY")
-    doc.drawRightString(width - 90, y, "PRICE")
-    doc.drawRightString(width - 48, y, "TOTAL")
-    y -= 10
-    doc.line(48, y, width - 48, y)
-    y -= 20
-    doc.setFont("Helvetica", 10)
-    for line in lines:
-        doc.drawString(48, y, line.description[:70])
-        doc.drawRightString(width - 160, y, str(line.quantity))
-        doc.drawRightString(width - 90, y, f"{line.unit_price:.2f}")
-        doc.drawRightString(width - 48, y, f"{line.line_total:.2f}")
-        y -= 22
-    y -= 10
-    doc.line(width - 220, y, width - 48, y)
-    y -= 22
-    for label, value in (("Subtotal", invoice.subtotal), ("VAT", invoice.tax_amount), ("Total", invoice.total)):
-        doc.setFont("Helvetica-Bold" if label == "Total" else "Helvetica", 11 if label == "Total" else 10)
-        doc.drawString(width - 220, y, label)
-        doc.drawRightString(width - 48, y, f"{invoice.currency} {value:.2f}")
-        y -= 22
-    if invoice.notes:
-        y -= 15
-        doc.setFont("Helvetica", 9)
-        doc.drawString(48, y, "Notes: " + invoice.notes[:100])
-    doc.save()
-    return out.getvalue()
+    result=await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==invoice_id,InvoiceLine.organization_id==m.organization_id).order_by(InvoiceLine.position,InvoiceLine.id)); return result.scalars().all()
 @router.get("/invoices/{invoice_id}/pdf")
-async def invoice_pdf(invoice_id:UUID,m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
-    invoice=await db.scalar(select(Invoice).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id))
-    if not invoice: raise HTTPException(404,"Invoice not found")
-    result=await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==invoice_id))
-    org=await db.scalar(select(Organization).where(Organization.id==invoice.organization_id))
-    logo_bytes = None
-    if org and org.logo_key:
-        try:
-            logo_bytes = await storage_provider().get(org.logo_key)
-        except Exception:
-            logo_bytes = None
-    recipient = None
-    if invoice.customer_id:
-        recipient = await db.scalar(select(Customer).where(Customer.id == invoice.customer_id, Customer.organization_id == m.organization_id))
-    elif invoice.supplier_id:
-        recipient = await db.scalar(select(Supplier).where(Supplier.id == invoice.supplier_id, Supplier.organization_id == m.organization_id))
-    return StreamingResponse(BytesIO(make_pdf(invoice,result.scalars().all(),org=org,logo_bytes=logo_bytes,recipient=recipient)),media_type="application/pdf",headers={"Content-Disposition":f'attachment; filename="{invoice.invoice_number}.pdf"'})
+async def invoice_pdf(invoice_id: UUID, m=Depends(current_membership), db: AsyncSession=Depends(get_db)):
+    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id, Invoice.organization_id == m.organization_id))
+    if not invoice:
+        raise HTTPException(404, "Invoice not found")
+    content = await storage_provider().get(invoice.issued_pdf_key) if invoice.issued_pdf_key else await invoice_content(db, invoice)
+    return Response(content, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=invoice.pdf"})
+
+@router.post("/invoices/{invoice_id}/issue", response_model=InvoiceOut)
+async def issue_invoice_route(invoice_id: UUID, user=Depends(current_user), m=Depends(write_membership), db: AsyncSession=Depends(get_db)):
+    invoice = await issue_invoice(db, m.organization_id, invoice_id, user.id)
+    await db.commit()
+    return await attach_organization_metadata(db, invoice)
+
+@router.get("/invoices/{invoice_id}/documents")
+async def invoice_documents(invoice_id: UUID, m=Depends(current_membership), db: AsyncSession=Depends(get_db)):
+    invoice = await db.scalar(select(Invoice.id).where(Invoice.id == invoice_id, Invoice.organization_id == m.organization_id))
+    if not invoice:
+        raise HTTPException(404, "Invoice not found")
+    rows = await db.execute(select(InvoiceDocument).where(InvoiceDocument.invoice_id == invoice_id, InvoiceDocument.organization_id == m.organization_id).order_by(InvoiceDocument.created_at))
+    return [{"id": str(doc.id), "filename": doc.original_filename, "content_type": doc.content_type, "size_bytes": doc.size_bytes} for doc in rows.scalars().all()]
+
+@router.get("/invoices/{invoice_id}/documents/{document_id}")
+async def download_invoice_document(invoice_id: UUID, document_id: UUID, m=Depends(current_membership), db: AsyncSession=Depends(get_db)):
+    document = await db.scalar(select(InvoiceDocument).where(InvoiceDocument.id == document_id, InvoiceDocument.invoice_id == invoice_id, InvoiceDocument.organization_id == m.organization_id))
+    if not document:
+        raise HTTPException(404, "Document not found")
+    return Response(await storage_provider().get(document.storage_key), media_type=document.content_type, headers={"Content-Disposition": "attachment; filename=original-invoice.pdf", "X-Content-Type-Options": "nosniff"})
+
 @router.post("/invoices/{invoice_id}/send",status_code=202)
-async def send_invoice(invoice_id:UUID,user=Depends(current_user),m=Depends(current_membership),db:AsyncSession=Depends(get_db)):
-    invoice=await db.scalar(select(Invoice).where(Invoice.id==invoice_id,Invoice.organization_id==m.organization_id))
-    if not invoice: raise HTTPException(404,"Invoice not found")
-    if not invoice.customer_id: raise HTTPException(422,"Invoice has no customer")
-    customer=await db.scalar(select(Customer).where(Customer.id==invoice.customer_id,Customer.organization_id==m.organization_id))
-    if not customer or not customer.email: raise HTTPException(422,"Customer has no email address")
-    rows=await db.execute(select(InvoiceLine).where(InvoiceLine.invoice_id==invoice.id))
-    org=await db.scalar(select(Organization).where(Organization.id==invoice.organization_id))
-    logo_bytes = None
-    if org and org.logo_key:
-        try:
-            logo_bytes = await storage_provider().get(org.logo_key)
-        except Exception:
-            logo_bytes = None
-    pdf=make_pdf(invoice,rows.scalars().all(),org=org,logo_bytes=logo_bytes,recipient=customer)
-    delivery=EmailDelivery(organization_id=m.organization_id,invoice_id=invoice.id,recipient=customer.email,status="sending"); db.add(delivery); await db.flush()
-    try:
-        delivery.provider_message_id=await email_provider().send_invoice(customer.email,f"Invoice {invoice.invoice_number}",f"Please find invoice {invoice.invoice_number} attached.",pdf,f"{invoice.invoice_number}.pdf"); delivery.status="sent"; delivery.sent_at=datetime.now(timezone.utc); invoice.status=InvoiceStatus.sent
-        db.add(AuditLog(organization_id=m.organization_id,user_id=user.id,action="invoice.sent",entity_type="invoice",entity_id=invoice.id,new_values={"recipient":customer.email}))
-    except Exception as exc:
-        delivery.status="failed"; delivery.failed_attempts+=1; delivery.error_message=str(exc)[:500]
-        await db.commit(); raise HTTPException(502,"Email delivery failed") from exc
-    await db.commit(); return {"status":delivery.status,"recipient":delivery.recipient}
+async def send_invoice(invoice_id: UUID, user=Depends(current_user), m=Depends(write_membership), db: AsyncSession=Depends(get_db), idempotency_key: str = Header(default="initial", max_length=80)):
+    return await queue_invoice(db, m.organization_id, invoice_id, user.id, idempotency_key)
 
 @router.post("/invoices/{invoice_id}/payments", response_model=InvoicePaymentOut, status_code=201)
 async def add_invoice_payment(
@@ -943,7 +787,7 @@ async def remove_invoice_payment(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        return await delete_manual_payment(db, m.organization_id, user.id, payment_id)
+        return await delete_manual_payment(db, m.organization_id, user.id, payment_id, expected_invoice_id=invoice_id)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -964,7 +808,7 @@ async def link_transaction_route(
             transaction_id=payload.transaction_id,
             amount=payload.amount,
         )
-        tx = await db.scalar(select(BankTransaction).where(BankTransaction.id == payload.transaction_id))
+        tx = await db.scalar(select(BankTransaction).where(BankTransaction.id == payload.transaction_id, BankTransaction.organization_id == m.organization_id))
         return InvoiceMatchOut(
             id=match_obj.id,
             invoice_id=match_obj.invoice_id,
@@ -1030,7 +874,7 @@ async def unlink_transaction_route(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        return await unlink_invoice_transaction(db, m.organization_id, user.id, match_id)
+        return await unlink_invoice_transaction(db, m.organization_id, user.id, match_id, expected_invoice_id=invoice_id)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -1040,9 +884,13 @@ async def linkable_transactions_route(
     m = Depends(current_membership),
     db: AsyncSession = Depends(get_db),
 ):
+    invoice = await db.scalar(select(Invoice).where(Invoice.id == invoice_id, Invoice.organization_id == m.organization_id))
+    if not invoice:
+        raise HTTPException(404, "Invoice not found")
+    direction = "credit" if invoice.invoice_type == InvoiceType.outgoing else "debit"
     tx_result = await db.execute(
         select(BankTransaction)
-        .where(BankTransaction.organization_id == m.organization_id)
+        .where(BankTransaction.organization_id == m.organization_id, BankTransaction.currency == invoice.currency, BankTransaction.direction == direction)
         .order_by(BankTransaction.booked_at.desc())
         .limit(100)
     )
@@ -1053,6 +901,7 @@ async def linkable_transactions_route(
         matched_val = await db.scalar(
             select(func.coalesce(func.sum(InvoiceTransactionMatch.amount), 0)).where(
                 InvoiceTransactionMatch.transaction_id == tx.id,
+                InvoiceTransactionMatch.organization_id == m.organization_id,
                 InvoiceTransactionMatch.invoice_id != invoice_id,
                 InvoiceTransactionMatch.confirmed == True,
             )
@@ -1117,12 +966,12 @@ async def bank_accounts(m: OrganizationMember = Depends(current_membership), db:
     return [{**account, "balance": str(balance["amount"]), "last_synced_at": datetime.now(timezone.utc).isoformat()}]
 
 @router.get("/banking/transactions")
-async def bank_transactions(m: OrganizationMember = Depends(current_membership), db: AsyncSession = Depends(get_db)):
+async def bank_transactions(m: OrganizationMember = Depends(current_membership), db: AsyncSession = Depends(get_db), limit: Annotated[int, Query(ge=1,le=500)]=100, offset: Annotated[int, Query(ge=0)]=0):
     result = await db.execute(
         select(BankTransaction)
         .where(BankTransaction.organization_id == m.organization_id)
-        .order_by(BankTransaction.booked_at.desc())
-        .limit(100)
+        .order_by(BankTransaction.booked_at.desc(), BankTransaction.id.desc())
+        .limit(limit).offset(offset)
     )
     saved = result.scalars().all()
     if saved:
@@ -1232,8 +1081,9 @@ async def banking_unlink_match(
 
 @router.post("/banking/connections/authorize")
 async def bank_authorize(
+    request: Request,
     payload: BankAuthorizeIn | None = None,
-    m: OrganizationMember = Depends(current_membership),
+    m: OrganizationMember = Depends(write_membership),
     db: AsyncSession = Depends(get_db),
 ):
     provider = EnableBankingProvider() if settings.banking_provider == "enable_banking" else MockBankingProvider()
@@ -1242,11 +1092,14 @@ async def bank_authorize(
     if not aspsp_country:
         org = await db.scalar(select(Organization).where(Organization.id == m.organization_id))
         aspsp_country = org.country if org and org.country else "DK"
+    state = secrets.token_urlsafe(32)
+    request.session["banking_state"] = {"value": state, "organization_id": str(m.organization_id), "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).timestamp()}
     try:
         url = await provider.create_authorization(
             callback_url=settings.frontend_url + "/banking/callback",
             aspsp_name=aspsp_name,
             aspsp_country=aspsp_country,
+            state=state,
         )
         return {"authorization_url": url}
     except ValueError as exc:
@@ -1256,11 +1109,16 @@ async def bank_authorize(
 
 @router.post("/banking/connections/callback")
 async def bank_callback(
+    request: Request,
     payload: BankCallbackIn,
     user: User = Depends(current_user),
-    m: OrganizationMember = Depends(current_membership),
+    m: OrganizationMember = Depends(write_membership),
     db: AsyncSession = Depends(get_db),
 ):
+    expected = request.session.pop("banking_state", None)
+    if not expected or not secrets.compare_digest(expected["value"], payload.state) or expected["organization_id"] != str(m.organization_id) or expected["expires_at"] < datetime.now(timezone.utc).timestamp():
+        raise HTTPException(400, "Bank authorization is invalid or expired; reconnect the bank")
+    await db.scalar(select(Organization.id).where(Organization.id == m.organization_id).with_for_update(key_share=True))
     provider = EnableBankingProvider() if settings.banking_provider == "enable_banking" else MockBankingProvider()
     try:
         session_data = await provider.handle_callback(payload.code)
@@ -1364,7 +1222,8 @@ async def bank_callback(
     }
 
 @router.post("/banking/sync")
-async def bank_sync(m: OrganizationMember = Depends(current_membership), db: AsyncSession = Depends(get_db)):
+async def bank_sync(m: OrganizationMember = Depends(write_membership), db: AsyncSession = Depends(get_db)):
+    await db.scalar(select(Organization.id).where(Organization.id == m.organization_id).with_for_update(key_share=True))
     provider = EnableBankingProvider() if settings.banking_provider == "enable_banking" else MockBankingProvider()
     result = await db.execute(select(BankAccount).where(BankAccount.organization_id == m.organization_id))
     accounts = list(result.scalars().all())
@@ -1503,8 +1362,8 @@ async def bank_sync(m: OrganizationMember = Depends(current_membership), db: Asy
     }
 
 @router.get("/audit")
-async def audit(m=Depends(admin_membership),db:AsyncSession=Depends(get_db)):
-    result=await db.execute(select(AuditLog).where(AuditLog.organization_id==m.organization_id).order_by(AuditLog.created_at.desc()).limit(100)); return result.scalars().all()
+async def audit(m=Depends(admin_membership),db:AsyncSession=Depends(get_db),limit: Annotated[int, Query(ge=1,le=500)]=100,offset: Annotated[int, Query(ge=0)]=0):
+    result=await db.execute(select(AuditLog).where(AuditLog.organization_id==m.organization_id).order_by(AuditLog.created_at.desc(), AuditLog.id.desc()).limit(limit).offset(offset)); return result.scalars().all()
 
 @router.get("/settings/infrastructure", response_model=InfrastructureSettingsOut)
 async def get_settings_infrastructure(

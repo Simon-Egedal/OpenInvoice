@@ -1,4 +1,5 @@
 "use client";
+import { minAmount, scaled, formatMoney } from "@/lib/money";
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
@@ -12,6 +13,7 @@ import {
   Unlink,
 } from "lucide-react";
 import { api, BankTransactionItem, Invoice } from "@/lib/api";
+import { Pagination } from "@/components/pagination";
 
 type Account = {
   id: string;
@@ -52,12 +54,15 @@ export default function Banking() {
   const [selectedInvoiceId, setSelectedInvoiceId] = useState("");
   const [matchAmount, setMatchAmount] = useState("");
   const [matching, setMatching] = useState(false);
+  const [page, setPage] = useState(0);
+  const [loading, setLoading] = useState(false);
 
   const loadData = async () => {
+    setLoading(true);
     try {
       const [accs, txs] = await Promise.all([
         api<Account[]>("/banking/accounts"),
-        api<BankTransactionItem[]>("/banking/transactions"),
+        api<BankTransactionItem[]>(`/banking/transactions?limit=50&offset=${page*50}`),
       ]);
       setAccounts(Array.isArray(accs) ? accs : []);
       setTx(Array.isArray(txs) ? txs : []);
@@ -66,12 +71,12 @@ export default function Banking() {
       setError(e instanceof Error ? e.message : "Failed to load banking data");
       setAccounts([]);
       setTx([]);
-    }
+    } finally { setLoading(false); }
   };
 
   useEffect(() => {
     loadData();
-  }, []);
+  }, [page]);
 
   async function handleConnectClick() {
     setConnecting(true);
@@ -133,16 +138,14 @@ export default function Banking() {
     setMatchAmount("");
     setShowMatchModal(true);
     try {
-      const allInvoices = await api<Invoice[]>("/invoices");
       const expectedType = tx.direction === "credit" ? "outgoing" : "incoming";
-      const unpaid = allInvoices.filter((inv) => Number(inv.due_amount ?? inv.total) > 0 && inv.invoice_type === expectedType);
+      const allInvoices = await api<Invoice[]>(`/invoices?unpaid=true&invoice_type=${expectedType}&currency=${tx.currency}&limit=500`);
+      const unpaid = allInvoices.filter((inv) => scaled(inv.due_amount ?? inv.total) > 0n && inv.invoice_type === expectedType && inv.currency === tx.currency && !["draft", "pending_approval", "rejected", "cancelled"].includes(inv.status));
       setOpenInvoices(unpaid);
       if (unpaid.length > 0) {
         const first = unpaid[0];
         setSelectedInvoiceId(first.id);
-        const unallocated = Number(tx.unmatched_amount || Math.abs(Number(tx.amount)));
-        const due = Number(first.due_amount ?? first.total);
-        setMatchAmount(Math.min(unallocated, due).toFixed(2));
+        setMatchAmount(minAmount(tx.unmatched_amount ?? tx.amount.replace("-", ""), first.due_amount));
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load invoices");
@@ -154,9 +157,7 @@ export default function Banking() {
     if (!matchTx) return;
     const inv = openInvoices.find((i) => i.id === invoiceId);
     if (!inv) return;
-    const unallocated = Number(matchTx.unmatched_amount || Math.abs(Number(matchTx.amount)));
-    const due = Number(inv.due_amount ?? inv.total);
-    setMatchAmount(Math.min(unallocated, due).toFixed(2));
+    setMatchAmount(minAmount(matchTx.unmatched_amount ?? matchTx.amount.replace("-", ""), inv.due_amount));
   }
 
   async function handleLinkSubmit(e: React.FormEvent) {
@@ -165,7 +166,7 @@ export default function Banking() {
     setMatching(true);
     setError("");
     try {
-      const amount = matchAmount ? parseFloat(matchAmount.replace(",", ".")) : undefined;
+      const amount = matchAmount ? matchAmount.replace(",", ".") : undefined;
       await api(`/banking/transactions/${matchTx.id}/link-invoice`, {
         method: "POST",
         body: JSON.stringify({
@@ -345,12 +346,12 @@ export default function Banking() {
                 <h2>Link Transaction to Invoice</h2>
                 <p style={{ margin: "4px 0 0", color: "var(--muted)", fontSize: 12 }}>
                   {matchTx.description} · {matchTx.currency}{" "}
-                  {Number(matchTx.amount).toLocaleString("en-DK", { minimumFractionDigits: 2 })}
-                  {Number(matchTx.unmatched_amount || 0) < Math.abs(Number(matchTx.amount)) && (
+                  {formatMoney(String(matchTx.amount))}
+                  {scaled(matchTx.unmatched_amount || "0") < scaled(matchTx.amount.replace("-", "")) && (
                     <span>
                       {" "}
                       (Available to link: {matchTx.currency}{" "}
-                      {Number(matchTx.unmatched_amount).toFixed(2)})
+                      {formatMoney(String(matchTx.unmatched_amount))})
                     </span>
                   )}
                 </p>
@@ -384,8 +385,8 @@ export default function Banking() {
                     {openInvoices.map((inv) => (
                       <option key={inv.id} value={inv.id}>
                         {inv.invoice_number} ({inv.invoice_type}) — Total: {inv.currency}{" "}
-                        {Number(inv.total).toFixed(2)} | Due: {inv.currency}{" "}
-                        {Number(inv.due_amount ?? inv.total).toFixed(2)}
+                        {formatMoney(String(inv.total))} | Due: {inv.currency}{" "}
+                        {formatMoney(String(inv.due_amount ?? inv.total))}
                       </option>
                     ))}
                   </select>
@@ -471,9 +472,7 @@ export default function Banking() {
                   </td>
                   <td className="mono" style={{ textAlign: "right", fontWeight: 600 }}>
                     {a.currency}{" "}
-                    {Number(a.balance).toLocaleString("en-DK", {
-                      minimumFractionDigits: 2,
-                    })}
+                    {formatMoney(String(a.balance))}
                   </td>
                 </tr>
               ))}
@@ -518,7 +517,7 @@ export default function Banking() {
             ) : (
               transactions.map((t) => {
                 const hasMatches = Array.isArray(t.matches) && t.matches.length > 0;
-                const isFullyMatched = hasMatches && Number(t.unmatched_amount || 0) <= 0;
+                const isFullyMatched = hasMatches && scaled(String(t.unmatched_amount || 0)) <= 0n;
                 const isPartiallyMatched = hasMatches && !isFullyMatched;
 
                 return (
@@ -532,13 +531,11 @@ export default function Banking() {
                       className="mono"
                       style={{
                         textAlign: "right",
-                        color: Number(t.amount) > 0 ? "#3d7150" : undefined,
+                        color: scaled(String(t.amount)) > 0n ? "#3d7150" : undefined,
                       }}
                     >
                       {t.currency}{" "}
-                      {Number(t.amount).toLocaleString("en-DK", {
-                        minimumFractionDigits: 2,
-                      })}
+                      {formatMoney(String(t.amount))}
                     </td>
                     <td>
                       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
@@ -572,7 +569,7 @@ export default function Banking() {
                                   {m.invoice_number}
                                 </Link>
                                 <span className="mono">
-                                  ({t.currency} {Number(m.amount).toFixed(2)})
+                                  ({t.currency} {formatMoney(String(m.amount))})
                                 </span>
                                 <button
                                   type="button"
@@ -619,9 +616,10 @@ export default function Banking() {
 
       {error && (
         <p className="error-text" role="alert" style={{ marginTop: 16 }}>
-          {error}
+          {error} <button className="button" onClick={loadData}>Retry</button>
         </p>
       )}
+      <Pagination page={page} count={transactions.length} busy={loading} onPage={setPage}/>
     </div>
   );
 }
