@@ -8,3 +8,4 @@ node_modules/
 dist/
 storage/
 *.py[cod]
+temp.txt

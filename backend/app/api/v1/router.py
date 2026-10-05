@@ -20,8 +20,8 @@ from app.models.entities import AuditLog, BankAccount, Customer, EmailDelivery, 
 from app.providers.banking import EnableBankingProvider, MockBankingProvider
 from app.providers.email import email_provider
 from app.providers.storage import storage_provider
-from app.schemas import CustomerIn, CustomerOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, RegisterIn, SetupIn, SupplierIn, SupplierOut, UserOut
-from app.services import create_invoice, money
+from app.schemas import CustomerIn, CustomerOut, InvoiceIn, InvoiceLineOut, InvoiceOut, LoginIn, OrganizationOut, RegisterIn, SetupAdminIn, SetupIn, SetupOrgOut, SupplierIn, SupplierOut, UserOut
+from app.services import create_initial_admin, create_initial_organization, create_invoice, money
 
 router=APIRouter()
 setup_lock=asyncio.Lock()
@@ -31,7 +31,33 @@ async def setup_status():
     saved=read_saved_settings()
     configured=bool(saved and saved.get("setup_completed"))
     applied=settings_are_applied(settings,saved)
-    return {"complete":configured,"applied":applied,"database_mode":saved.get("database_mode") if saved else None}
+    has_organization = False
+    has_admin = False
+    org_id = None
+    org_name = None
+    if applied:
+        try:
+            from app.db.session import SessionLocal
+            async with SessionLocal() as db:
+                org = await db.scalar(select(Organization).order_by(Organization.created_at.asc()))
+                if org:
+                    has_organization = True
+                    org_id = str(org.id)
+                    org_name = org.name
+                user = await db.scalar(select(User).limit(1))
+                if user:
+                    has_admin = True
+        except Exception:
+            pass
+    return {
+        "complete": configured,
+        "applied": applied,
+        "database_mode": saved.get("database_mode") if saved else None,
+        "has_organization": has_organization,
+        "has_admin": has_admin,
+        "organization_id": org_id,
+        "organization_name": org_name,
+    }
 
 async def verify_database(url: str) -> None:
     engine=create_async_engine(url,connect_args={"timeout":8})
@@ -84,8 +110,125 @@ async def configure_installation(payload:SetupIn):
         save_settings(values)
         return {"status":"saved","restart_required":True,"message":"Configuration saved securely. Restart the API so it can run migrations with these settings."}
 
+@router.post("/setup/organization")
+async def setup_organization(
+    name: str = Form(min_length=1, max_length=200),
+    country: str = Form(default="DK"),
+    currency: str = Form(default="DKK"),
+    logo: UploadFile | None = File(None),
+    db: AsyncSession = Depends(get_db),
+):
+    saved = read_saved_settings()
+    if not saved or not saved.get("setup_completed"):
+        raise HTTPException(409, "Complete installation setup first")
+    if not settings_are_applied(settings, saved):
+        raise HTTPException(409, "Restart the API to apply configuration before setting up an organization")
+
+    logo_bytes = None
+    logo_filename = None
+    content_type = None
+    if logo and logo.filename:
+        logo_bytes = await logo.read(5 * 1024 * 1024 + 1)
+        if len(logo_bytes) > 5 * 1024 * 1024:
+            raise HTTPException(413, "Logo image must be 5 MB or smaller")
+        content_type = logo.content_type or "image/png"
+        if not (content_type.startswith("image/") or logo.filename.lower().endswith((".png", ".jpg", ".jpeg", ".svg", ".webp", ".gif"))):
+            raise HTTPException(415, "Only image files (PNG, JPG, SVG, WebP) are accepted for the organization logo")
+        logo_filename = logo.filename
+
+    try:
+        org = await create_initial_organization(
+            db=db,
+            name=name,
+            country=country,
+            currency=currency,
+            logo_bytes=logo_bytes,
+            logo_filename=logo_filename,
+            content_type=content_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+    return {
+        "id": str(org.id),
+        "name": org.name,
+        "country": org.country,
+        "currency": org.currency,
+        "logo_key": org.logo_key,
+        "logo_url": f"/organizations/{org.id}/logo" if org.logo_key else None,
+    }
+
+@router.get("/setup/organization")
+async def get_setup_organization(db: AsyncSession = Depends(get_db)):
+    org = await db.scalar(select(Organization).order_by(Organization.created_at.asc()))
+    if not org:
+        raise HTTPException(404, "No organization has been set up yet")
+    return {
+        "id": str(org.id),
+        "name": org.name,
+        "country": org.country,
+        "currency": org.currency,
+        "logo_key": org.logo_key,
+        "logo_url": f"/organizations/{org.id}/logo" if org.logo_key else None,
+    }
+
+@router.post("/setup/admin", response_model=UserOut, status_code=201)
+async def setup_admin(
+    payload: SetupAdminIn,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    saved = read_saved_settings()
+    if not saved or not saved.get("setup_completed"):
+        raise HTTPException(409, "Complete installation setup first")
+    if not settings_are_applied(settings, saved):
+        raise HTTPException(409, "Restart the API to apply configuration before creating an admin account")
+
+    try:
+        user, org = await create_initial_admin(
+            db=db,
+            full_name=payload.full_name,
+            email=payload.email,
+            password=payload.password,
+            organization_id=payload.organization_id,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "already exists" in msg or "already registered" in msg:
+            raise HTTPException(409, msg) from exc
+        raise HTTPException(422, msg) from exc
+
+    request.session["user_id"] = str(user.id)
+    return user
+
+@router.get("/organizations/{org_id}/logo")
+async def organization_logo(org_id: UUID, db: AsyncSession = Depends(get_db)):
+    org = await db.scalar(select(Organization).where(Organization.id == org_id))
+    if not org or not org.logo_key:
+        raise HTTPException(404, "Logo not found")
+    try:
+        content = await storage_provider().get(org.logo_key)
+    except Exception as exc:
+        raise HTTPException(404, "Logo not found") from exc
+
+    media_type = "image/png"
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        media_type = "image/png"
+    elif content.startswith(b"\xff\xd8\xff"):
+        media_type = "image/jpeg"
+    elif content.startswith(b"<svg") or b"<svg" in content[:200]:
+        media_type = "image/svg+xml"
+    elif content.startswith(b"RIFF") and b"WEBP" in content[:12]:
+        media_type = "image/webp"
+    elif content.startswith(b"GIF87a") or content.startswith(b"GIF89a"):
+        media_type = "image/gif"
+    return Response(content=content, media_type=media_type)
+
 @router.post("/auth/register",response_model=UserOut,status_code=201)
 async def register(payload:RegisterIn,request:Request,db:AsyncSession=Depends(get_db)):
+    existing_user = await db.scalar(select(User).limit(1))
+    if existing_user:
+        raise HTTPException(403, "Public registration is disabled. Please contact your organization administrator.")
     saved=read_saved_settings()
     if not saved or not saved.get("setup_completed"): raise HTTPException(409,"Complete installation setup before creating an account")
     if not settings_are_applied(settings,saved): raise HTTPException(409,"Restart the API to apply configuration before creating an account")

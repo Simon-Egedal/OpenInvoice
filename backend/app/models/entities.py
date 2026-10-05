@@ -32,6 +32,7 @@ class Organization(IdMixin, TimestampMixin, Base):
     name: Mapped[str]=mapped_column(String(200))
     country: Mapped[str]=mapped_column(String(2), default="DK")
     currency: Mapped[str]=mapped_column(String(3), default="DKK")
+    logo_key: Mapped[str|None]=mapped_column(String(500), nullable=True)
 
 class OrganizationMember(IdMixin, TimestampMixin, Base):
     __tablename__="organization_members"

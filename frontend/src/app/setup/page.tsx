@@ -1,12 +1,283 @@
 "use client";
-import Link from "next/link";import {useEffect,useState} from "react";import {ArrowRight,Check,Database,HardDrive,Mail,ShieldCheck,WalletCards} from "lucide-react";import {api} from "@/lib/api";
-type Status={complete:boolean;applied:boolean;database_mode:string|null};
-export default function SetupPage(){const [status,setStatus]=useState<Status|null>(null);const [error,setError]=useState("");const [saved,setSaved]=useState(false);const [busy,setBusy]=useState(false);const [dbMode,setDbMode]=useState("bundled");const [emailProvider,setEmailProvider]=useState("console");const [storageProvider,setStorageProvider]=useState("local");const [bankingProvider,setBankingProvider]=useState("mock");useEffect(()=>{api<Status>("/setup/status").then(setStatus).catch(()=>setStatus({complete:false,applied:false,database_mode:null}))},[]);async function submit(e:React.FormEvent<HTMLFormElement>){e.preventDefault();setBusy(true);setError("");const data=Object.fromEntries(new FormData(e.currentTarget));data.database_mode=dbMode;data.email_provider=emailProvider;data.storage_provider=storageProvider;data.banking_provider=bankingProvider;data.database_ssl=String(data.database_ssl==="on");data.smtp_use_tls=String(data.smtp_use_tls==="on");data.session_cookie_secure=String(data.session_cookie_secure==="on");try{await api("/setup/configure",{method:"POST",body:JSON.stringify(data)});setSaved(true)}catch(e){setError(e instanceof Error?e.message:"Setup could not be saved")}finally{setBusy(false)}}if(!status)return <div className="page setup-page"><p>Loading setup…</p></div>;if(status.complete)return <div className="page setup-page"><Brand/><div className="setup-success"><span className="setup-success-icon"><Check size={22}/></span><h1 className="page-title">{status.applied?"Setup is complete":"Configuration saved"}</h1><p className="page-description">{status.applied?"Your services are configured. Create the first owner account to continue.":"Restart the API once so it can apply your database settings and run migrations."}</p>{!status.applied&&<div className="notice setup-command"><code>docker compose restart api</code><br/>Then reload this page to create the first owner account.</div>}<Link className="button button-primary" href="/auth">{status.applied?"Create owner account":"Continue"} <ArrowRight size={14}/></Link></div></div>;if(saved)return <div className="page setup-page"><Brand/><div className="setup-success"><span className="setup-success-icon"><Check size={22}/></span><h1 className="page-title">Setup saved</h1><p className="page-description">Your settings are encrypted on the application data volume. Restart the API to apply them.</p><div className="notice setup-command"><code>docker compose restart api</code><br/>After it restarts, reload this page to create the first owner account.</div><button className="button button-primary" onClick={()=>window.location.reload()}>Check setup status</button></div></div>;
-return <div className="page setup-page"><Brand/><div className="setup-intro"><div className="setup-eyebrow"><ShieldCheck size={14}/> FIRST RUN SETUP</div><h1 className="page-title">Configure your workspace</h1><p className="page-description">Choose where OpenInvoice stores data and how it connects to your services. You can use the bundled defaults to get started.</p></div><form onSubmit={submit} className="setup-form"><SetupSection icon={<Database size={17}/>} title="Database" detail="PostgreSQL stores your invoices, contacts and activity."/><div className="setup-fields"><Field label="PostgreSQL setup"><select value={dbMode} onChange={e=>setDbMode(e.target.value)}><option value="bundled">Bundled PostgreSQL (recommended)</option><option value="external">Use an existing PostgreSQL server</option></select></Field>{dbMode==="bundled"?<p className="setup-hint">Uses the PostgreSQL container from Docker Compose. No connection details needed.</p>:<><div className="setup-grid"><Field label="Host"><input name="database_host" placeholder="db.example.com" required/></Field><Field label="Port"><input name="database_port" type="number" defaultValue="5432" required/></Field><Field label="Database name"><input name="database_name" defaultValue="openinvoice" required/></Field><Field label="Username"><input name="database_username" required/></Field><Field label="Password"><input name="database_password" type="password" autoComplete="new-password" required/></Field></div><label className="check-field"><input name="database_ssl" type="checkbox"/>Require TLS for the database connection</label><p className="setup-hint">The database must already exist and be reachable by the API container. Migrations run after the API restarts.</p></>}</div>
-<SetupSection icon={<Mail size={17}/>} title="Email" detail="Choose SMTP delivery or keep messages in the API log during setup."/><div className="setup-fields"><Field label="Email provider"><select value={emailProvider} onChange={e=>setEmailProvider(e.target.value)}><option value="console">Console (development)</option><option value="smtp">SMTP server</option></select></Field>{emailProvider==="console"?<p className="setup-hint">Outgoing messages are logged locally and are not delivered.</p>:<div className="setup-grid"><Field label="SMTP host"><input name="smtp_host" placeholder="smtp.example.com" required/></Field><Field label="Port"><input name="smtp_port" type="number" defaultValue="587" required/></Field><Field label="Username"><input name="smtp_username" autoComplete="username"/></Field><Field label="Password"><input name="smtp_password" type="password" autoComplete="new-password"/></Field><Field label="From address"><input name="smtp_from" placeholder="Invoices <billing@example.com>" required/></Field><label className="check-field"><input name="smtp_use_tls" type="checkbox" defaultChecked/>Use STARTTLS</label><p className="setup-hint setup-span">We check the SMTP connection and credentials before saving.</p></div>}</div>
-<SetupSection icon={<HardDrive size={17}/>} title="Document storage" detail="Invoice PDFs stay outside PostgreSQL."/><div className="setup-fields"><Field label="Storage provider"><select value={storageProvider} onChange={e=>setStorageProvider(e.target.value)}><option value="local">Local filesystem</option><option value="s3">S3-compatible bucket</option></select></Field>{storageProvider==="local"?<p className="setup-hint">Files are saved to the persistent Docker data volume.</p>:<div className="setup-grid"><Field label="S3 endpoint (optional)"><input name="s3_endpoint_url" placeholder="https://s3.example.com"/></Field><Field label="Region"><input name="s3_region" defaultValue="eu-central-1" required/></Field><Field label="Bucket name"><input name="s3_bucket" required/></Field><Field label="Access key ID"><input name="s3_access_key_id" required/></Field><Field label="Secret access key"><input name="s3_secret_access_key" type="password" autoComplete="new-password" required/></Field><p className="setup-hint setup-span">Bucket access is checked before saving.</p></div>}</div>
-<SetupSection icon={<WalletCards size={17}/>} title="Banking" detail="Use demo data now or configure the Enable Banking adapter."/><div className="setup-fields"><Field label="Banking provider"><select value={bankingProvider} onChange={e=>setBankingProvider(e.target.value)}><option value="mock">Mock banking (recommended)</option><option value="enable_banking">Enable Banking</option></select></Field>{bankingProvider==="enable_banking"&&<div className="setup-grid"><Field label="Enable Banking application ID"><input name="enable_banking_app_id" required/></Field><Field label="Private key path inside API container"><input name="enable_banking_private_key_path" placeholder="/run/secrets/enable-banking.pem" required/></Field><p className="setup-hint setup-span">The integration adapter is a scaffold. Live bank authorization is not available yet.</p></div>}</div>
-<div className="setup-security"><ShieldCheck size={16}/><div><strong>Secure configuration</strong><p>Provider credentials are encrypted on the persistent application volume. A signing key is generated automatically.</p></div></div><label className="check-field setup-cookie"><input name="session_cookie_secure" type="checkbox"/>Serve secure session cookies (enable when using HTTPS)</label>{error&&<p className="error-text" role="alert">{error}</p>}<button disabled={busy} className="button button-primary setup-submit">{busy?"Checking connections…":"Save configuration"}<ArrowRight size={15}/></button><p className="setup-footnote">Database, SMTP and bucket access are checked before configuration is saved.</p></form></div>}
-function Brand(){return <div className="setup-brand"><span className="brand-mark">O</span>OpenInvoice</div>}
-function SetupSection({icon,title,detail}:{icon:React.ReactNode;title:string;detail:string}){return <div className="setup-section"><span className="setup-section-icon">{icon}</span><div><h2>{title}</h2><p>{detail}</p></div></div>}
-function Field({label,children}:{label:string;children:React.ReactNode}){return <label className="field"><span>{label}</span>{children}</label>}
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import { ArrowRight, Check, Database, HardDrive, Mail, ShieldCheck, WalletCards } from "lucide-react";
+import { api, SetupStatus } from "@/lib/api";
+
+export default function SetupPage() {
+  const router = useRouter();
+  const [status, setStatus] = useState<SetupStatus | null>(null);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [dbMode, setDbMode] = useState("bundled");
+  const [emailProvider, setEmailProvider] = useState("console");
+  const [storageProvider, setStorageProvider] = useState("local");
+  const [bankingProvider, setBankingProvider] = useState("mock");
+
+  const checkStatus = async () => {
+    try {
+      const s = await api<SetupStatus>("/setup/status");
+      setStatus(s);
+      if (s.complete && s.applied) {
+        if (!s.has_organization) {
+          router.replace("/setup/organization");
+        } else if (!s.has_admin) {
+          router.replace("/setup/admin");
+        } else {
+          router.replace("/");
+        }
+      }
+      return s;
+    } catch {
+      const fallback: SetupStatus = {
+        complete: false,
+        applied: false,
+        database_mode: null,
+        has_organization: false,
+        has_admin: false,
+      };
+      setStatus(fallback);
+      return fallback;
+    }
+  };
+
+  useEffect(() => {
+    checkStatus();
+  }, []);
+
+  async function submit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    setBusy(true);
+    setError("");
+    const data = Object.fromEntries(new FormData(e.currentTarget));
+    data.database_mode = dbMode;
+    data.email_provider = emailProvider;
+    data.storage_provider = storageProvider;
+    data.banking_provider = bankingProvider;
+    data.database_ssl = String(data.database_ssl === "on");
+    data.smtp_use_tls = String(data.smtp_use_tls === "on");
+    data.session_cookie_secure = String(data.session_cookie_secure === "on");
+    try {
+      await api("/setup/configure", { method: "POST", body: JSON.stringify(data) });
+      setSaved(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Setup could not be saved");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!status) {
+    return (
+      <div className="page setup-page">
+        <p>Loading setup…</p>
+      </div>
+    );
+  }
+
+  if (status.complete) {
+    return (
+      <div className="page setup-page">
+        <Brand />
+        <div className="setup-success">
+          <span className="setup-success-icon"><Check size={22} /></span>
+          <h1 className="page-title">{status.applied ? "Setup is complete" : "Configuration saved"}</h1>
+          <p className="page-description">
+            {status.applied
+              ? "Your services are configured. Continue to set up your organization."
+              : "Restart the API once so it can apply your database settings and run migrations."}
+          </p>
+          {!status.applied && (
+            <div className="notice setup-command">
+              <code>docker compose restart api</code>
+              <br />After restarting, check status to continue with organization setup.
+            </div>
+          )}
+          {status.applied ? (
+            <Link className="button button-primary" href="/setup/organization">
+              Set up organization <ArrowRight size={14} />
+            </Link>
+          ) : (
+            <button className="button button-primary" onClick={checkStatus}>
+              Check setup status
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (saved) {
+    return (
+      <div className="page setup-page">
+        <Brand />
+        <div className="setup-success">
+          <span className="setup-success-icon"><Check size={22} /></span>
+          <h1 className="page-title">Setup saved</h1>
+          <p className="page-description">
+            Your settings are encrypted on the application data volume. Restart the API to apply them.
+          </p>
+          <div className="notice setup-command">
+            <code>docker compose restart api</code>
+            <br />After it restarts, click below to set up your organization.
+          </div>
+          <button className="button button-primary" onClick={checkStatus}>
+            Check setup status
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="page setup-page">
+      <Brand />
+      <div className="setup-intro">
+        <div className="setup-eyebrow"><ShieldCheck size={14} /> FIRST RUN SETUP</div>
+        <h1 className="page-title">Configure your workspace</h1>
+        <p className="page-description">
+          Choose where OpenInvoice stores data and how it connects to your services. You can use the bundled defaults to get started.
+        </p>
+      </div>
+      <form onSubmit={submit} className="setup-form">
+        <SetupSection icon={<Database size={17} />} title="Database" detail="PostgreSQL stores your invoices, contacts and activity." />
+        <div className="setup-fields">
+          <Field label="PostgreSQL setup">
+            <select value={dbMode} onChange={e => setDbMode(e.target.value)}>
+              <option value="bundled">Bundled PostgreSQL (recommended)</option>
+              <option value="external">Use an existing PostgreSQL server</option>
+            </select>
+          </Field>
+          {dbMode === "bundled" ? (
+            <p className="setup-hint">Uses the PostgreSQL container from Docker Compose. No connection details needed.</p>
+          ) : (
+            <>
+              <div className="setup-grid">
+                <Field label="Host"><input name="database_host" placeholder="db.example.com" required /></Field>
+                <Field label="Port"><input name="database_port" type="number" defaultValue="5432" required /></Field>
+                <Field label="Database name"><input name="database_name" defaultValue="openinvoice" required /></Field>
+                <Field label="Username"><input name="database_username" required /></Field>
+                <Field label="Password"><input name="database_password" type="password" autoComplete="new-password" required /></Field>
+              </div>
+              <label className="check-field">
+                <input name="database_ssl" type="checkbox" />Require TLS for the database connection
+              </label>
+              <p className="setup-hint">The database must already exist and be reachable by the API container. Migrations run after the API restarts.</p>
+            </>
+          )}
+        </div>
+
+        <SetupSection icon={<Mail size={17} />} title="Email" detail="Choose SMTP delivery or keep messages in the API log during setup." />
+        <div className="setup-fields">
+          <Field label="Email provider">
+            <select value={emailProvider} onChange={e => setEmailProvider(e.target.value)}>
+              <option value="console">Console (development)</option>
+              <option value="smtp">SMTP server</option>
+            </select>
+          </Field>
+          {emailProvider === "console" ? (
+            <p className="setup-hint">Outgoing messages are logged locally and are not delivered.</p>
+          ) : (
+            <div className="setup-grid">
+              <Field label="SMTP host"><input name="smtp_host" placeholder="smtp.example.com" required /></Field>
+              <Field label="Port"><input name="smtp_port" type="number" defaultValue="587" required /></Field>
+              <Field label="Username"><input name="smtp_username" autoComplete="username" /></Field>
+              <Field label="Password"><input name="smtp_password" type="password" autoComplete="new-password" /></Field>
+              <Field label="From address"><input name="smtp_from" placeholder="Invoices <billing@example.com>" required /></Field>
+              <label className="check-field">
+                <input name="smtp_use_tls" type="checkbox" defaultChecked />Use STARTTLS
+              </label>
+              <p className="setup-hint setup-span">We check the SMTP connection and credentials before saving.</p>
+            </div>
+          )}
+        </div>
+
+        <SetupSection icon={<HardDrive size={17} />} title="Document storage" detail="Invoice PDFs stay outside PostgreSQL." />
+        <div className="setup-fields">
+          <Field label="Storage provider">
+            <select value={storageProvider} onChange={e => setStorageProvider(e.target.value)}>
+              <option value="local">Local filesystem</option>
+              <option value="s3">S3-compatible bucket</option>
+            </select>
+          </Field>
+          {storageProvider === "local" ? (
+            <p className="setup-hint">Files are saved to the persistent Docker data volume.</p>
+          ) : (
+            <div className="setup-grid">
+              <Field label="S3 endpoint (optional)"><input name="s3_endpoint_url" placeholder="https://s3.example.com" /></Field>
+              <Field label="Region"><input name="s3_region" defaultValue="eu-central-1" required /></Field>
+              <Field label="Bucket name"><input name="s3_bucket" required /></Field>
+              <Field label="Access key ID"><input name="s3_access_key_id" required /></Field>
+              <Field label="Secret access key"><input name="s3_secret_access_key" type="password" autoComplete="new-password" required /></Field>
+              <p className="setup-hint setup-span">Bucket access is checked before saving.</p>
+            </div>
+          )}
+        </div>
+
+        <SetupSection icon={<WalletCards size={17} />} title="Banking" detail="Use demo data now or configure the Enable Banking adapter." />
+        <div className="setup-fields">
+          <Field label="Banking provider">
+            <select value={bankingProvider} onChange={e => setBankingProvider(e.target.value)}>
+              <option value="mock">Mock banking (recommended)</option>
+              <option value="enable_banking">Enable Banking</option>
+            </select>
+          </Field>
+          {bankingProvider === "enable_banking" && (
+            <div className="setup-grid">
+              <Field label="Enable Banking application ID"><input name="enable_banking_app_id" required /></Field>
+              <Field label="Private key path inside API container"><input name="enable_banking_private_key_path" placeholder="/run/secrets/enable-banking.pem" required /></Field>
+              <p className="setup-hint setup-span">The integration adapter is a scaffold. Live bank authorization is not available yet.</p>
+            </div>
+          )}
+        </div>
+
+        <div className="setup-security">
+          <ShieldCheck size={16} />
+          <div>
+            <strong>Secure configuration</strong>
+            <p>Provider credentials are encrypted on the persistent application volume. A signing key is generated automatically.</p>
+          </div>
+        </div>
+        <label className="check-field setup-cookie">
+          <input name="session_cookie_secure" type="checkbox" />Serve secure session cookies (enable when using HTTPS)
+        </label>
+        {error && <p className="error-text" role="alert">{error}</p>}
+        <button disabled={busy} className="button button-primary setup-submit">
+          {busy ? "Checking connections…" : "Save configuration"}<ArrowRight size={15} />
+        </button>
+        <p className="setup-footnote">Database, SMTP and bucket access are checked before configuration is saved.</p>
+      </form>
+    </div>
+  );
+}
+
+function Brand() {
+  return (
+    <div className="setup-brand">
+      <span className="brand-mark">O</span>OpenInvoice
+    </div>
+  );
+}
+
+function SetupSection({ icon, title, detail }: { icon: React.ReactNode; title: string; detail: string }) {
+  return (
+    <div className="setup-section">
+      <span className="setup-section-icon">{icon}</span>
+      <div>
+        <h2>{title}</h2>
+        <p>{detail}</p>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="field">
+      <span>{label}</span>
+      {children}
+    </label>
+  );
+}

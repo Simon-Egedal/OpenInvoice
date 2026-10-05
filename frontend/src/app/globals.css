@@ -5,3 +5,8 @@
 @media(max-width:640px){.setup-page{padding-top:22px}.setup-brand{margin-bottom:28px}.setup-grid{grid-template-columns:1fr}.setup-fields{padding-left:0}.setup-intro .page-title{font-size:23px}}
 .setup-shell{min-height:100vh;padding:1px 24px 40px;background:#fff}
 .field>span{font-size:12px;font-weight:600;color:#414943}
+.logo-dropzone{border:1px dashed var(--line);border-radius:6px;padding:22px 16px;text-align:center;background:var(--wash);cursor:pointer;transition:border-color .15s ease,background .15s ease}
+.logo-dropzone:hover{border-color:var(--accent);background:var(--accent-wash)}
+.logo-preview-box{display:flex;align-items:center;gap:14px;padding:12px 14px;border:1px solid var(--line);border-radius:6px;background:#fff}
+.logo-preview-thumb{width:52px;height:52px;object-fit:contain;border:1px solid var(--line);border-radius:5px;background:#fff;padding:3px}
+
